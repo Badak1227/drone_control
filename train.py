@@ -1,3 +1,4 @@
+import csv
 import math
 import random
 
@@ -7,12 +8,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from dask.graph_manipulation import checkpoint
+from matplotlib import cm
 from torch.distributions import Normal
 import numpy as np
 import time
 import os
 import matplotlib.pyplot as plt
 from collections import deque
+
+from torchvision import models
 
 
 # 기본 설정 클래스
@@ -138,28 +142,31 @@ class PrioritizedSequenceReplayBuffer:
 
 
 # --- CNN Feature Extractor ---
-class CNNFeatureExtractor(nn.Module):
-    def __init__(self):
+class SimpleCNNFeatureExtractor(nn.Module):
+    def __init__(self, output_dim=256):
         super().__init__()
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)  # → 32×20×20
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)  # → 64×9×9
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)  # → 64×7×7
+        # 더 간단한 CNN 구조
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
-        # Fully-connected layer
-        self.fc = nn.Linear(64 * 7 * 7, 512)
+        # 특징 맵 크기 계산 (84x84 입력 기준)
+        # 첫 번째 층 이후: (84-8)/4+1 = 20
+        # 두 번째 층 이후: (20-4)/2+1 = 9
+        # 세 번째 층 이후: (9-3)/1+1 = 7
+        # 따라서 최종 특징 맵 크기는 7x7x64 = 3136
+
+        self.fc = nn.Linear(7 * 7 * 64, output_dim)
+        self.bn = nn.BatchNorm1d(output_dim)
 
     def forward(self, x):
-        """
-        x: Tensor of shape [B, 1, 84, 84]
-        returns: features of shape [B, 512]
-        """
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
-        x = x.view(x.shape[0], -1)  # flatten
-        features = F.relu(self.fc(x))
-        return features
+        x = x.view(x.size(0), -1)  # 평탄화
+        x = self.fc(x)
+        x = self.bn(x)
+        return F.relu(x)
 
 
 # --- Actor Network (Policy) ---
@@ -223,49 +230,70 @@ class QNetwork(nn.Module):
 
 # --- Agent ---
 class RSACAgent(nn.Module):
-    def __init__(self, state_dim=9):
+    def __init__(self, state_dim=6):  # 자세 정보 제외한 상태 차원
         super().__init__()
-        # shared feature
-        self.cnn = CNNFeatureExtractor()
-        self.state_fc = nn.Linear(state_dim, 128)
-        self.gru = nn.GRU(512 + 128, 256, batch_first=True)
+        # 특징 추출
+        self.cnn = SimpleCNNFeatureExtractor(output_dim=256)
+        self.cnn_bn = nn.BatchNorm1d(256)
 
-        # actor & critics
+        # 상태 처리
+        self.state_fc = nn.Linear(state_dim, 128)
+        self.state_bn = nn.BatchNorm1d(128)
+
+        # GRU 사용
+        self.rnn = nn.GRU(256 + 128, 256, batch_first=True)
+
+        # 액터 & 크리틱
         self.actor = PolicyNetwork(256, Config.action_dim, Config.max_action)
         self.q1 = QNetwork(256, Config.action_dim)
         self.q2 = QNetwork(256, Config.action_dim)
 
-        # target critics
+        # 타겟 크리틱
         self.target_q1 = QNetwork(256, Config.action_dim)
         self.target_q2 = QNetwork(256, Config.action_dim)
         self._copy_weights()
 
-        # optimizers
+        # 최적화기
         self.opt_critic = optim.Adam(
             list(self.cnn.parameters()) +
             list(self.state_fc.parameters()) +
-            list(self.gru.parameters()) +
-            list(self.q1.parameters()) + list(self.q2.parameters()),
-            lr=Config.lr_critic)
+            list(self.rnn.parameters()) +
+            list(self.q1.parameters()) +
+            list(self.q2.parameters()),
+            lr=Config.lr_critic
+        )
         self.opt_actor = optim.Adam(self.actor.parameters(), lr=Config.lr_actor)
         self.log_alpha = torch.zeros(1, requires_grad=True, device=Config.device)
         self.opt_alpha = optim.Adam([self.log_alpha], lr=Config.lr_alpha)
 
     def _copy_weights(self):
-        for p, tp in zip(self.q1.parameters(), self.target_q1.parameters()): tp.data.copy_(p.data)
-        for p, tp in zip(self.q2.parameters(), self.target_q2.parameters()): tp.data.copy_(p.data)
+        for p, tp in zip(self.q1.parameters(), self.target_q1.parameters()):
+            tp.data.copy_(p.data)
+        for p, tp in zip(self.q2.parameters(), self.target_q2.parameters()):
+            tp.data.copy_(p.data)
 
     def forward(self, obs_seq, state_seq, h=None, evaluate=False):
         B, L, C, H, W = obs_seq.shape
-        x_img = obs_seq.view(B * L, C, H, W)
-        feats_img = self.cnn(x_img).view(B, L, -1)
-        x_st = state_seq.view(B * L, -1)
-        feats_st = F.relu(self.state_fc(x_st)).view(B, L, -1)
+
+        # CNN 특징 추출 및 정규화
+        x_img = obs_seq.reshape(B * L, C, H, W)
+        feats_img = self.cnn(x_img)
+        feats_img = self.cnn_bn(feats_img)
+        feats_img = feats_img.reshape(B, L, -1)
+
+        # 상태 특징 추출 및 정규화
+        x_st = state_seq.reshape(B * L, -1)
+        feats_st = self.state_fc(x_st)
+        feats_st = self.state_bn(feats_st)
+        feats_st = F.relu(feats_st).reshape(B, L, -1)
+
+        # 특징 결합
         feats = torch.cat([feats_img, feats_st], dim=-1)
 
+        # GRU 처리
         if h is None:
             h = torch.zeros(1, B, 256, device=Config.device)
-        out, h_new = self.gru(feats, h)
+        out, h_new = self.rnn(feats, h)
         last = out[:, -1]
 
         if evaluate:
@@ -274,6 +302,7 @@ class RSACAgent(nn.Module):
         else:
             action, logp = self.actor.sample(last)
             return action, logp, last, h_new
+
 
     def select_action(self, obs_seq, state_seq, h=None, evaluate=False):
         with torch.no_grad():
@@ -287,890 +316,126 @@ class RSACAgent(nn.Module):
     def update(self, buffer):
         seqs, idxs, isw = buffer.sample(Config.batch_size, Config.seq_length)
         if not seqs: return
-        # build tensors
-        obs_seq = torch.stack([torch.stack([torch.from_numpy(t.depth_image) for t in s], 0) for s in seqs])
-        obs_seq = obs_seq.unsqueeze(2).to(Config.device).float()
-        state_seq = torch.stack([torch.stack([torch.from_numpy(t.state) for t in s], 0) for s in seqs])
-        state_seq = state_seq.to(Config.device).float()
+
+        # 텐서 변환 시 명시적으로 float32 타입 사용
+        obs_seq = torch.stack(
+            [torch.stack([torch.from_numpy(np.array(t.depth_image, dtype=np.float32)) for t in s], 0) for s in seqs])
+        obs_seq = obs_seq.unsqueeze(2).to(Config.device)
+        state_seq = torch.stack(
+            [torch.stack([torch.from_numpy(np.array(t.state, dtype=np.float32)) for t in s], 0) for s in seqs])
+        state_seq = state_seq.to(Config.device)
 
         bi = Config.burn_in
         obs_b, obs_l = obs_seq[:, :bi], obs_seq[:, bi:]
         st_b, st_l = state_seq[:, :bi], state_seq[:, bi:]
 
-        # burn-in GRU
+        # burn-in GRU - 배치 정규화 적용
         h0 = torch.zeros(1, Config.batch_size, 256, device=Config.device)
-        _, h0 = self.gru(torch.cat([self.cnn(obs_b.view(-1, 1, 84, 84)).view(Config.batch_size, bi, -1),
-                                    F.relu(self.state_fc(st_b.view(-1, 9))).view(Config.batch_size, bi, -1)], -1), h0)
-        # learning pass
-        out, _ = self.gru(
-            torch.cat([self.cnn(obs_l.view(-1, 1, 84, 84)).view(Config.batch_size, Config.seq_length - bi, -1),
-                       F.relu(self.state_fc(st_l.view(-1, 9))).view(Config.batch_size, Config.seq_length - bi, -1)],
-                      -1), h0)
-        last = out[:, -1]
 
-        # extract actions, rewards
-        actions = torch.stack([torch.tensor(s[-1].action) for s in seqs]).to(Config.device).float()
-        r_ev = torch.tensor([s[-1].reward_evade for s in seqs], device=Config.device)
-        r_ap = torch.tensor([s[-1].reward_approach for s in seqs], device=Config.device)
-        done = torch.tensor([s[-1].done for s in seqs], device=Config.device).float()
+        # CNN 특징 처리 (배치 정규화 포함)
+        cnn_feats_b = self.cnn(obs_b.reshape(-1, 1, 84, 84))
+        cnn_feats_b = self.cnn_bn(cnn_feats_b)
+        cnn_feats_b = cnn_feats_b.reshape(Config.batch_size, bi, -1)
 
-        # critic update
+        # 상태 특징 처리 - 6차원으로 수정
+        state_feats_b = self.state_fc(st_b.reshape(-1, 6))
+        state_feats_b = self.state_bn(state_feats_b)
+        state_feats_b = F.relu(state_feats_b)
+        state_feats_b = state_feats_b.reshape(Config.batch_size, bi, -1)
+
+        # 특징 결합 및 GRU 처리
+        _, h0 = self.rnn(torch.cat([cnn_feats_b, state_feats_b], -1), h0)
+
+        # learning pass - 배치 정규화 적용
+        # CNN 특징 처리
+        cnn_feats_l = self.cnn(obs_l.reshape(-1, 1, 84, 84))
+        cnn_feats_l = self.cnn_bn(cnn_feats_l)
+        cnn_feats_l = cnn_feats_l.reshape(Config.batch_size, Config.seq_length - bi, -1)
+
+        # 상태 특징 처리 - 6차원으로 수정
+        state_feats_l = self.state_fc(st_l.reshape(-1, 6))
+        state_feats_l = self.state_bn(state_feats_l)
+        state_feats_l = F.relu(state_feats_l)
+        state_feats_l = state_feats_l.reshape(Config.batch_size, Config.seq_length - bi, -1)
+
+        # 특징 결합 및 GRU 처리
+        out, _ = self.rnn(torch.cat([cnn_feats_l, state_feats_l], -1), h0)
+
+        # 마지막 출력 저장 (이후에 여러 번 복사하여 사용)
+        last = out[:, -1].clone()
+
+        # 액션, 보상, 완료 상태 준비 - 단일 보상 값 사용
+        actions = torch.stack([torch.tensor(s[-1].action, dtype=torch.float32) for s in seqs]).to(Config.device)
+        r = torch.tensor([float(s[-1].reward) for s in seqs], dtype=torch.float32, device=Config.device)
+        done = torch.tensor([float(s[-1].done) for s in seqs], dtype=torch.float32, device=Config.device)
+
+        # 1. 크리틱 업데이트
         with torch.no_grad():
             a_next, logp_next = self.actor.sample(last)
             q1n = self.target_q1(last, a_next).squeeze(-1)
             q2n = self.target_q2(last, a_next).squeeze(-1)
-            alpha = self.log_alpha.exp()
-            target = r_ev + (1 - done) * Config.gamma * (torch.min(q1n, q2n) - alpha * logp_next.squeeze(-1))
+            alpha = torch.clamp(self.log_alpha.exp(), min=1e-10, max=10.0)  # 안정성을 위한 클램핑
+            target = r + (1 - done) * Config.gamma * (torch.min(q1n, q2n) - alpha * logp_next.squeeze(-1))
+
+        # 크리틱 손실 계산 및 업데이트
         q1_cur = self.q1(last, actions).squeeze(-1)
         q2_cur = self.q2(last, actions).squeeze(-1)
         critic_loss = F.mse_loss(q1_cur, target) + F.mse_loss(q2_cur, target)
+
         self.opt_critic.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.q1.parameters()) + list(self.q2.parameters()) +
+            list(self.cnn.parameters()) + list(self.state_fc.parameters()) +
+            list(self.rnn.parameters()),
+            max_norm=1.0
+        )
         self.opt_critic.step()
 
-        # actor update
-        action_pi, logp_pi = self.actor.sample(last)
-        q1_pi = self.q1(last, action_pi).squeeze(-1)
-        q2_pi = self.q2(last, action_pi).squeeze(-1)
+        # 2. 액터 업데이트 - 새로운 계산 그래프 사용
+        last_actor = last.detach().clone()  # 완전히 분리된 복사본
+
+        action_pi, logp_pi = self.actor.sample(last_actor)
+        q1_pi = self.q1(last_actor, action_pi).squeeze(-1)
+        q2_pi = self.q2(last_actor, action_pi).squeeze(-1)
         q_pi = torch.min(q1_pi, q2_pi)
-        actor_loss = (alpha.detach() * logp_pi.squeeze(-1) - q_pi).mean()
+
+        # 알파 값은 계산 그래프에서 분리
+        alpha_detached = self.log_alpha.exp().detach()
+
+        actor_loss = (alpha_detached * logp_pi.squeeze(-1) - q_pi).mean()
+
         self.opt_actor.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.opt_actor.step()
 
-        # alpha update
-        alpha_loss = -(self.log_alpha * (logp_pi.detach().squeeze(-1) + Config.target_entropy)).mean()
+        # 3. 알파 업데이트 - 또 다른 독립적인 계산 그래프
+        logp_pi_detached = logp_pi.detach().squeeze(-1)  # 그래프에서 분리
+
+        alpha_loss = -(self.log_alpha * (logp_pi_detached + Config.target_entropy)).mean()
+
         self.opt_alpha.zero_grad()
         alpha_loss.backward()
         self.opt_alpha.step()
 
-        # soft update targets
-        for p, tp in zip(self.q1.parameters(), self.target_q1.parameters()): tp.data.copy_(
-            tp.data * (1 - Config.tau) + p.data * Config.tau)
-        for p, tp in zip(self.q2.parameters(), self.target_q2.parameters()): tp.data.copy_(
-            tp.data * (1 - Config.tau) + p.data * Config.tau)
+        # 4. 타겟 네트워크 소프트 업데이트
+        for p, tp in zip(self.q1.parameters(), self.target_q1.parameters()):
+            tp.data.copy_(tp.data * (1 - Config.tau) + p.data * Config.tau)
+        for p, tp in zip(self.q2.parameters(), self.target_q2.parameters()):
+            tp.data.copy_(tp.data * (1 - Config.tau) + p.data * Config.tau)
 
-        return {'critic_loss': critic_loss.item(), 'actor_loss': actor_loss.item(),
-                'alpha': self.log_alpha.exp().item()}
-
-# --- Layer 1: Obstacle Avoidance Module ---
-class ObstacleAvoidanceModule(nn.Module):
-    def __init__(self, drone_state_dim=9):
-        super().__init__()
-        self.cnn = CNNFeatureExtractor()
-
-        # Add FC layer to process drone state
-        self.state_fc = nn.Linear(drone_state_dim, 128)
-
-        # Adjust GRU input dimension to combine CNN features and state features
-        self.gru = nn.GRU(512 + 128, 256, batch_first=True)
-
-        self.actor = PolicyNetwork(256, Config.action_dim, Config.max_action)
-        self.q1 = QNetwork(256, Config.action_dim)
-        self.q2 = QNetwork(256, Config.action_dim)
-
-    def process_features(self, obs_seq, drone_state_seq):
-        """
-        Process observations and drone states to extract features
-        obs_seq: [B, L, 1, H, W]
-        drone_state_seq: [B, L, drone_state_dim]
-        returns: combined_feats [B, L, 512+128]
-        """
-        B, L, C, H, W = obs_seq.shape
-
-        # Extract features through CNN
-        x_img = obs_seq.reshape(B * L, C, H, W)
-        img_feats = self.cnn(x_img).reshape(B, L, 512)
-
-        # Process drone state
-        x_state = drone_state_seq.reshape(B * L, -1)
-        state_feats = F.relu(self.state_fc(x_state)).reshape(B, L, 128)
-
-        # Combine image features and state features
-        combined_feats = torch.cat([img_feats, state_feats], dim=2)
-        return combined_feats
-
-    def forward(self, obs_seq, drone_state_seq, h=None):
-        """
-        obs_seq: [B, L, C, H, W] tensor of observation sequence batch
-        drone_state_seq: [B, L, drone_state_dim] tensor of drone state sequence
-        h: GRU hidden state
-        """
-        B = obs_seq.shape[0]
-
-        # Initialize hidden state if not provided
-        if h is None:
-            h = torch.zeros(1, B, 256, device=Config.device)
-
-        # Process features
-        combined_feats = self.process_features(obs_seq, drone_state_seq)
-
-        # Process temporal information through GRU
-        out_seq, h_new = self.gru(combined_feats, h)
-
-        # Use output from last timestep
-        last = out_seq[:, -1]
-
-        # Sample action
-        a, logp = self.actor.sample(last)
-
-        # Calculate Q values
-        q1 = self.q1(last, a)
-        q2 = self.q2(last, a)
-
-        return out_seq, h_new, a, logp, q1, q2
-
-
-# --- Layer 2: Navigation Module ---
-class NavigationModule(nn.Module):
-    def __init__(self, drone_state_dim=9):
-        super().__init__()
-        self.cnn = CNNFeatureExtractor()
-
-        # Add FC layer to process drone state
-        self.state_fc = nn.Linear(drone_state_dim, 128)
-
-        # Adjust GRU input dimension for all combined features
-        self.gru = nn.GRU(512 + 128, 256, batch_first=True)
-
-        self.actor = PolicyNetwork(256, Config.action_dim, Config.max_action)
-        self.q1 = QNetwork(256, Config.action_dim)
-        self.q2 = QNetwork(256, Config.action_dim)
-
-    def process_features(self, obs_seq, drone_state_seq):
-        """
-        Process observations and drone states to extract features
-        obs_seq: [B, L, 1, H, W]
-        drone_state_seq: [B, L, drone_state_dim]
-        returns: combined_feats [B, L, 512+128]
-        """
-        B, L, C, H, W = obs_seq.shape
-
-        # Extract features through CNN
-        x_img = obs_seq.reshape(B * L, C, H, W)
-        img_feats = self.cnn(x_img).reshape(B, L, 512)
-
-        # Process drone state
-        x_state = drone_state_seq.reshape(B * L, -1)
-        state_feats = F.relu(self.state_fc(x_state)).reshape(B, L, 128)
-
-        # Combine image features and state features
-        combined_feats = torch.cat([img_feats, state_feats], dim=2)
-        return combined_feats
-
-    def forward(self, obs_seq, drone_state_seq, h=None):
-        """
-        obs_seq: [B, L, C, H, W] tensor of observation sequence batch
-        drone_state_seq: [B, L, drone_state_dim] tensor of drone state sequence
-        h: GRU hidden state
-        """
-        B = obs_seq.shape[0]
-
-        # Initialize hidden state if not provided
-        if h is None:
-            h = torch.zeros(1, B, 256, device=Config.device)
-
-        # Process features
-        combined_feats = self.process_features(obs_seq, drone_state_seq)
-
-        # Process temporal information through GRU
-        out_seq, h_new = self.gru(combined_feats, h)
-
-        # Use output from last timestep
-        last = out_seq[:, -1]
-
-        # Sample action
-        a, logp = self.actor.sample(last)
-
-        # Calculate Q values
-        q1 = self.q1(last, a)
-        q2 = self.q2(last, a)
-
-        return out_seq, h_new, a, logp, q1, q2
-
-
-# --- Integrated Network to select between the two sub-actions ---
-class IntegratedNetwork(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(256 + 256, 256)  # Takes outputs from both modules
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 1)  # Outputs a value between 0 and 1
-
-    def forward(self, x1, x2):
-        """
-        x1: output from obstacle avoidance module [B, 256]
-        x2: output from navigation module [B, 256]
-        returns: mixing coefficient [B, 1] in range [0, 1]
-        """
-        x = torch.cat([x1, x2], dim=-1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.sigmoid(self.fc3(x))  # Output between 0 and 1
-        return x
-
-
-# --- Layered RSAC Agent ---
-class LayeredRSACAgent(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # 모듈 초기화
-        self.layer1 = ObstacleAvoidanceModule().to(Config.device)  # 장애물 회피
-        self.layer2 = NavigationModule().to(Config.device)  # 내비게이션
-        self.integrated = IntegratedNetwork().to(Config.device)  # 통합 결정
-
-        # 타겟 네트워크 초기화
-        self.target_q1_1 = QNetwork(256, Config.action_dim).to(Config.device)
-        self.target_q1_2 = QNetwork(256, Config.action_dim).to(Config.device)
-        self.target_q2_1 = QNetwork(256, Config.action_dim).to(Config.device)
-        self.target_q2_2 = QNetwork(256, Config.action_dim).to(Config.device)
-
-        # 가중치 복사
-        self._copy_weights()
-
-        # 옵티마이저 초기화
-        # 1) Critic1 optimizer: q1, q2, (필요 시 cnn/state_fc/gru 포함)
-        critic1_params = (
-                list(self.layer1.cnn.parameters()) +
-                list(self.layer1.state_fc.parameters()) +
-                list(self.layer1.gru.parameters()) +
-                list(self.layer1.q1.parameters()) +
-                list(self.layer1.q2.parameters())
-        )
-        self.opt1 = optim.Adam(critic1_params, lr=Config.lr_critic)
-
-        # Actor1 optimizer: 오직 actor 네트워크만
-        self.opt_actor1 = optim.Adam(self.layer1.actor.parameters(), lr=Config.lr_actor)
-
-        # 2) Critic2 optimizer
-        critic2_params = (
-                list(self.layer2.cnn.parameters()) +
-                list(self.layer2.state_fc.parameters()) +
-                list(self.layer2.gru.parameters()) +
-                list(self.layer2.q1.parameters()) +
-                list(self.layer2.q2.parameters())
-        )
-        self.opt2 = optim.Adam(critic2_params, lr=Config.lr_critic)
-
-        # Actor2 optimizer
-        self.opt_actor2 = optim.Adam(self.layer2.actor.parameters(), lr=Config.lr_actor)
-
-        self.opt_integrated = optim.Adam(self.integrated.parameters(), lr=Config.lr_critic)
-
-        # 엔트로피 관련
-        self.log_alpha1 = torch.zeros(1, requires_grad=True, device=Config.device)
-        self.log_alpha2 = torch.zeros(1, requires_grad=True, device=Config.device)
-        self.alpha_opt1 = optim.Adam([self.log_alpha1], lr=Config.lr_alpha)
-        self.alpha_opt2 = optim.Adam([self.log_alpha2], lr=Config.lr_alpha)
-
-    def _copy_weights(self):
-        """타겟 네트워크에 초기 가중치 복사"""
-        for t, p in zip(self.target_q1_1.parameters(), self.layer1.q1.parameters()):
-            t.data.copy_(p.data)
-        for t, p in zip(self.target_q1_2.parameters(), self.layer1.q2.parameters()):
-            t.data.copy_(p.data)
-        for t, p in zip(self.target_q2_1.parameters(), self.layer2.q1.parameters()):
-            t.data.copy_(p.data)
-        for t, p in zip(self.target_q2_2.parameters(), self.layer2.q2.parameters()):
-            t.data.copy_(p.data)
-
-    def select_action(self, obs_seq, drone_state_seq, h1=None, h2=None, evaluate=False):
-        """
-        Select action based on current observations
-        obs_seq: [B, L, C, H, W] tensor of observation sequence batch
-        drone_state_seq: [B, L, drone_state_dim] tensor of drone state sequence
-        h1, h2: Hidden states for the two modules
-        evaluate: If True, use deterministic action, if False, use stochastic action
-        """
-        B = obs_seq.size(0)
-
-        # Proper hidden state initialization for GRU
-        if h1 is None:
-            h1 = torch.zeros(1, B, 256, device=Config.device)
-        if h2 is None:
-            h2 = torch.zeros(1, B, 256, device=Config.device)
-
+        # TD 오류를 계산하여 PER 업데이트
         with torch.no_grad():
-            # Get outputs from both modules
-            out1, h1_new, a1, _, _, _ = self.layer1(obs_seq, drone_state_seq, h1)
-            out2, h2_new, a2, _, _, _ = self.layer2(obs_seq, drone_state_seq, h2)
+            td_errors = torch.abs(q1_cur - target).cpu().numpy().tolist()
 
-            if evaluate:
-                # Evaluation mode: deterministic actions
-                a1 = self.layer1.actor.get_action(out1[:, -1])
-                a2 = self.layer2.actor.get_action(out2[:, -1])
+        buffer.update_priorities(idxs, td_errors)
 
-            # Integration selection (mix between the two actions)
-            mix = self.integrated(out1[:, -1], out2[:, -1])
-
-            # Choose action based on mixing coefficient
-            a = mix * a1 + (1 - mix) * a2
-
-        return a, h1_new, h2_new
-
-    def soft_update(self, net, target_net):
-        """타겟 네트워크 소프트 업데이트"""
-        with torch.no_grad():
-            for p, tp in zip(net.parameters(), target_net.parameters()):
-                tp.copy_(tp * (1 - Config.tau) + p * Config.tau)
-
-    def update(self, buffer):
-        """
-        One-step SAC update using full sequences with burn-in handled separately.
-        """
-        # 문제 진단을 위한 anomaly detection 활성화
-        torch.autograd.set_detect_anomaly(True)
-
-        try:
-            # 1) Sample a batch of sequences
-            seqs, indices, is_weights = buffer.sample(Config.batch_size, Config.seq_length)
-            if not seqs:
-                return None
-
-            B = len(seqs)
-            bi = Config.burn_in
-            T = Config.seq_length - bi
-
-            # print("\n===== DEBUG: STEP 1 - DATA SAMPLING =====")
-            # print(f"Batch size: {B}, Burn-in: {bi}, Learn steps: {T}")
-
-            # 2) Build tensors: observations [B, seq_len, 1, H, W], states [B, seq_len, state_dim]
-            obs_seq = torch.stack([
-                torch.stack([torch.from_numpy(t.depth_image) for t in s], dim=0)
-                for s in seqs
-            ], dim=0).unsqueeze(2).to(Config.device, dtype=torch.float32)  # [B, L, 1, H, W]
-
-            state_seq = torch.stack([
-                torch.stack([torch.from_numpy(t.state) for t in s], dim=0)
-                for s in seqs
-            ], dim=0).to(Config.device, dtype=torch.float32)  # [B, L, state_dim]
-
-            # print("\n===== DEBUG: STEP 2 - INPUT TENSORS =====")
-            # print(f"obs_seq shape: {obs_seq.shape}, dtype: {obs_seq.dtype}")
-            # print(
-            #     f"obs_seq stats: min={obs_seq.min().item():.4f}, max={obs_seq.max().item():.4f}, mean={obs_seq.mean().item():.4f}")
-            #
-            # print(f"state_seq shape: {state_seq.shape}, dtype: {state_seq.dtype}")
-            # print(
-            #     f"state_seq stats: min={state_seq.min().item():.4f}, max={state_seq.max().item():.4f}, mean={state_seq.mean().item():.4f}")
-
-            # NaN 체크
-            has_nan_obs = torch.isnan(obs_seq).any()
-            has_nan_state = torch.isnan(state_seq).any()
-            # print(f"NaN in observations: {has_nan_obs}")
-            # print(f"NaN in states: {has_nan_state}")
-
-            # 3) Extract action, reward, done for learning
-            actions = torch.stack([
-                torch.tensor(s[-1].action, dtype=torch.float32)
-                for s in seqs
-            ], dim=0).to(Config.device)  # [B, action_dim]
-
-            r_ev = torch.tensor([s[-1].reward_evade for s in seqs],
-                                dtype=torch.float32, device=Config.device)  # [B]
-            r_ap = torch.tensor([s[-1].reward_approach for s in seqs],
-                                dtype=torch.float32, device=Config.device)  # [B]
-            done = torch.tensor([s[-1].done for s in seqs],
-                                dtype=torch.float32, device=Config.device)  # [B]
-
-            # print("\n===== DEBUG: STEP 3 - ACTION & REWARDS =====")
-            # print(f"actions shape: {actions.shape}, dtype: {actions.dtype}")
-            # print(
-            #     f"actions stats: min={actions.min().item():.4f}, max={actions.max().item():.4f}, mean={actions.mean().item():.4f}")
-            #
-            # print(
-            #     f"reward_evade stats: min={r_ev.min().item():.4f}, max={r_ev.max().item():.4f}, mean={r_ev.mean().item():.4f}")
-            # print(
-            #     f"reward_approach stats: min={r_ap.min().item():.4f}, max={r_ap.max().item():.4f}, mean={r_ap.mean().item():.4f}")
-            # print(f"done stats: count(1)={done.sum().item()}/{B}")
-
-            # 4) Split sequences into burn-in and learning parts
-            obs_burn_in = obs_seq[:, :bi].clone()
-            obs_learn = obs_seq[:, bi:].clone()
-            state_burn_in = state_seq[:, :bi].clone()
-            state_learn = state_seq[:, bi:].clone()
-
-            # print("\n===== DEBUG: STEP 4 - BURN-IN & LEARNING SPLIT =====")
-            # print(f"obs_burn_in shape: {obs_burn_in.shape}")
-            # print(f"obs_learn shape: {obs_learn.shape}")
-            #
-            # # 5) Process features for burn-in
-            # print("\n===== DEBUG: STEP 5 - FEATURE EXTRACTION =====")
-            try:
-                # Process features for burn-in
-                features1_burn = self.layer1.process_features(obs_burn_in, state_burn_in)
-                features2_burn = self.layer2.process_features(obs_burn_in, state_burn_in)
-
-                # print(f"features1_burn shape: {features1_burn.shape}")
-                # print(
-                #     f"features1_burn stats: min={features1_burn.min().item():.4f}, max={features1_burn.max().item():.4f}, mean={features1_burn.mean().item():.4f}")
-                # print(f"NaN in features1_burn: {torch.isnan(features1_burn).any()}")
-
-                # Initialize hidden states
-                h1 = torch.zeros(1, B, 256, device=Config.device)
-                h2 = torch.zeros(1, B, 256, device=Config.device)
-
-                #print(f"h1 initial shape: {h1.shape}")
-
-                # Run GRU for burn-in sequences
-                _, h1 = self.layer1.gru(features1_burn, h1)
-                _, h2 = self.layer2.gru(features2_burn, h2)
-
-                # print(
-                #     f"h1 after burn-in stats: min={h1.min().item():.4f}, max={h1.max().item():.4f}, mean={h1.mean().item():.4f}")
-                # print(f"NaN in h1: {torch.isnan(h1).any()}")
-
-                # Process features for learning
-                features1_learn = self.layer1.process_features(obs_learn, state_learn)
-                features2_learn = self.layer2.process_features(obs_learn, state_learn)
-
-                # print(f"features1_learn shape: {features1_learn.shape}")
-                # print(f"NaN in features1_learn: {torch.isnan(features1_learn).any()}")
-
-                # Run GRU for learning sequences
-                out_seq1, _ = self.layer1.gru(features1_learn, h1)
-                out_seq2, _ = self.layer2.gru(features2_learn, h2)
-
-                # print(f"out_seq1 shape: {out_seq1.shape}")
-                # print(
-                #     f"out_seq1 stats: min={out_seq1.min().item():.4f}, max={out_seq1.max().item():.4f}, mean={out_seq1.mean().item():.4f}")
-                # print(f"NaN in out_seq1: {torch.isnan(out_seq1).any()}")
-
-                # Get last output features
-                last_feat1 = out_seq1[:, -1].clone()
-                last_feat2 = out_seq2[:, -1].clone()
-
-                # print(f"last_feat1 shape: {last_feat1.shape}")
-                # print(
-                #     f"last_feat1 stats: min={last_feat1.min().item():.4f}, max={last_feat1.max().item():.4f}, mean={last_feat1.mean().item():.4f}")
-                # print(f"NaN in last_feat1: {torch.isnan(last_feat1).any()}")
-
-            except Exception as e:
-                print(f"ERROR in feature extraction: {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # 6) Critic targets and losses for layer1
-            #print("\n===== DEBUG: STEP 6 - CRITIC TARGETS (Layer 1) =====")
-            try:
-                with torch.no_grad():
-                    a1_next, logp1_next = self.layer1.actor.sample(last_feat1.detach())
-
-                    # print(f"a1_next shape: {a1_next.shape}")
-                    # print(
-                    #     f"a1_next stats: min={a1_next.min().item():.4f}, max={a1_next.max().item():.4f}, mean={a1_next.mean().item():.4f}")
-                    # print(
-                    #     f"logp1_next stats: min={logp1_next.min().item():.4f}, max={logp1_next.max().item():.4f}, mean={logp1_next.mean().item():.4f}")
-                    # print(f"NaN in a1_next: {torch.isnan(a1_next).any()}")
-                    # print(f"NaN in logp1_next: {torch.isnan(logp1_next).any()}")
-
-                    # 안전장치: logp가 NaN이면 대체
-                    if torch.isnan(logp1_next).any():
-                        logp1_next = torch.nan_to_num(logp1_next, nan=-20.0)
-                        print("WARNING: NaN detected in logp1_next, replaced with -20.0")
-
-                    q1_next1 = self.target_q1_1(last_feat1.detach(), a1_next)
-                    q1_next2 = self.target_q1_2(last_feat1.detach(), a1_next)
-
-                    #print(
-                    #    f"q1_next1 stats: min={q1_next1.min().item():.4f}, max={q1_next1.max().item():.4f}, mean={q1_next1.mean().item():.4f}")
-                    #print(
-                    #    f"q1_next2 stats: min={q1_next2.min().item():.4f}, max={q1_next2.max().item():.4f}, mean={q1_next2.mean().item():.4f}")
-
-                    q1n = torch.min(q1_next1, q1_next2).squeeze(-1)
-
-                    # 안전장치: q1n 값 제한
-                    q1n = torch.clamp(q1n, min=-100.0, max=100.0)
-
-                    # 알파 안정화
-                    alpha1 = torch.clamp(self.log_alpha1.exp(), min=1e-10, max=10.0)
-                    #print(f"alpha1 value: {alpha1.item():.6f}")
-
-                    # 타겟 계산
-                    entropy_term = alpha1 * logp1_next.squeeze(-1)
-                    target1 = r_ev + (1 - done) * Config.gamma * (q1n - entropy_term)
-
-                    # 안전장치: 타겟 값 제한
-                    target1 = torch.clamp(target1, min=-100.0, max=100.0)
-
-                    # print(
-                    #     f"target1 stats: min={target1.min().item():.4f}, max={target1.max().item():.4f}, mean={target1.mean().item():.4f}")
-                    # print(f"NaN in target1: {torch.isnan(target1).any()}")
-
-                # 현재 Q 값 계산
-                q11 = self.layer1.q1(last_feat1, actions).squeeze(-1)
-                q12 = self.layer1.q2(last_feat1, actions).squeeze(-1)
-
-                #print(
-                #    f"q11 stats: min={q11.min().item():.4f}, max={q11.max().item():.4f}, mean={q11.mean().item():.4f}")
-                #print(
-                #    f"q12 stats: min={q12.min().item():.4f}, max={q12.max().item():.4f}, mean={q12.mean().item():.4f}")
-                #print(f"NaN in q11: {torch.isnan(q11).any()}")
-                #print(f"NaN in q12: {torch.isnan(q12).any()}")
-
-                # 손실 계산 전 NaN 체크 및 대체
-                if torch.isnan(q11).any() or torch.isnan(target1).any():
-                    print("WARNING: NaN detected before critic loss calculation!")
-                    q11 = torch.nan_to_num(q11, nan=0.0)
-                    q12 = torch.nan_to_num(q12, nan=0.0)
-                    target1 = torch.nan_to_num(target1, nan=0.0)
-
-                critic1_loss = F.mse_loss(q11, target1) + F.mse_loss(q12, target1)
-                #print(f"critic1_loss: {critic1_loss.item():.6f}")
-                #print(f"NaN in critic1_loss: {torch.isnan(critic1_loss).any()}")
-
-            except Exception as e:
-                print(f"ERROR in critic target calculation (Layer 1): {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # 7) Actor and alpha losses for layer1
-            #print("\n===== DEBUG: STEP 7 - ACTOR LOSS (Layer 1) =====")
-            try:
-                # Actor loss 계산을 위한 분리된 복제본 사용
-                last_feat1_actor = last_feat1.clone().detach().requires_grad_(True)
-                a1_pi, logp1 = self.layer1.actor.sample(last_feat1_actor)
-
-                #print(f"a1_pi shape: {a1_pi.shape}")
-                #print(
-                #    f"a1_pi stats: min={a1_pi.min().item():.4f}, max={a1_pi.max().item():.4f}, mean={a1_pi.mean().item():.4f}")
-                #print(
-                #    f"logp1 stats: min={logp1.min().item():.4f}, max={logp1.max().item():.4f}, mean={logp1.mean().item():.4f}")
-
-                # NaN 체크 및 대체
-                if torch.isnan(logp1).any():
-                    print("WARNING: NaN detected in logp1!")
-                    logp1 = torch.nan_to_num(logp1, nan=-20.0)
-
-                q1_pi1 = self.layer1.q1(last_feat1_actor, a1_pi)
-                q1_pi2 = self.layer1.q2(last_feat1_actor, a1_pi)
-                #print(
-                #    f"q1_pi1 stats: min={q1_pi1.min().item():.4f}, max={q1_pi1.max().item():.4f}, mean={q1_pi1.mean().item():.4f}")
-
-                q1_pi = torch.min(q1_pi1, q1_pi2).squeeze(-1)
-
-                # 알파값 안정화
-                alpha1_actor = torch.clamp(self.log_alpha1.exp().detach(), min=1e-10, max=10.0)
-
-                actor1_loss = (alpha1_actor * logp1.squeeze(-1) - q1_pi).mean()
-                #print(f"actor1_loss: {actor1_loss.item():.6f}")
-                #print(f"NaN in actor1_loss: {torch.isnan(actor1_loss).any()}")
-
-                # Alpha loss
-                alpha1_loss = -(self.log_alpha1 * (logp1.squeeze(-1).detach() + Config.target_entropy)).mean()
-                #print(f"alpha1_loss: {alpha1_loss.item():.6f}")
-
-            except Exception as e:
-                print(f"ERROR in actor loss calculation (Layer 1): {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # 8) Layer 2 repeat steps 6-7 (간략화)
-            #print("\n===== DEBUG: STEP 8 - LAYER 2 LOSSES =====")
-            try:
-                # Critic targets for layer2
-                with torch.no_grad():
-                    a2_next, logp2_next = self.layer2.actor.sample(last_feat2.detach())
-
-                    # NaN 체크 및 대체
-                    if torch.isnan(logp2_next).any():
-                        logp2_next = torch.nan_to_num(logp2_next, nan=-20.0)
-                        print("WARNING: NaN detected in logp2_next, replaced with -20.0")
-
-                    q2n = torch.min(
-                        self.target_q2_1(last_feat2.detach(), a2_next),
-                        self.target_q2_2(last_feat2.detach(), a2_next)
-                    ).squeeze(-1)
-
-                    # 안전장치: q2n 값 제한
-                    q2n = torch.clamp(q2n, min=-100.0, max=100.0)
-
-                    # 알파 안정화
-                    alpha2 = torch.clamp(self.log_alpha2.exp(), min=1e-10, max=10.0)
-
-                    target2 = r_ap + (1 - done) * Config.gamma * (q2n - alpha2 * logp2_next.squeeze(-1))
-                    target2 = torch.clamp(target2, min=-100.0, max=100.0)
-
-                q21 = self.layer2.q1(last_feat2, actions).squeeze(-1)
-                q22 = self.layer2.q2(last_feat2, actions).squeeze(-1)
-
-                if torch.isnan(q21).any() or torch.isnan(target2).any():
-                    q21 = torch.nan_to_num(q21, nan=0.0)
-                    q22 = torch.nan_to_num(q22, nan=0.0)
-                    target2 = torch.nan_to_num(target2, nan=0.0)
-
-                critic2_loss = F.mse_loss(q21, target2) + F.mse_loss(q22, target2)
-                #print(f"critic2_loss: {critic2_loss.item():.6f}")
-
-                # Actor loss for layer2
-                last_feat2_actor = last_feat2.clone().detach().requires_grad_(True)
-                a2_pi, logp2 = self.layer2.actor.sample(last_feat2_actor)
-
-                if torch.isnan(logp2).any():
-                    print("WARNING: NaN detected in logp2!")
-                    logp2 = torch.nan_to_num(logp2, nan=-20.0)
-
-                q2_pi = torch.min(
-                    self.layer2.q1(last_feat2_actor, a2_pi),
-                    self.layer2.q2(last_feat2_actor, a2_pi)
-                ).squeeze(-1)
-
-                alpha2_actor = torch.clamp(self.log_alpha2.exp().detach(), min=1e-10, max=10.0)
-
-                actor2_loss = (alpha2_actor * logp2.squeeze(-1) - q2_pi).mean()
-                #print(f"actor2_loss: {actor2_loss.item():.6f}")
-
-                alpha2_loss = -(self.log_alpha2 * (logp2.squeeze(-1).detach() + Config.target_entropy)).mean()
-
-            except Exception as e:
-                print(f"ERROR in Layer 2 loss calculation: {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # 9) Integrated network loss
-            #print("\n===== DEBUG: STEP 9 - INTEGRATED NETWORK =====")
-            try:
-                # 복제본 사용하여 인플레이스 연산 방지
-                last_feat1_int = last_feat1.clone().detach()
-                last_feat2_int = last_feat2.clone().detach()
-
-                mix = self.integrated(last_feat1_int, last_feat2_int)
-                #print(
-                #    f"mix stats: min={mix.min().item():.4f}, max={mix.max().item():.4f}, mean={mix.mean().item():.4f}")
-
-                # Simple heuristic: If evade reward is negative, prioritize avoidance action
-                obstacle_danger = (r_ev < 0).float().unsqueeze(-1).clone()
-                #print(f"obstacle_danger: count(1)={obstacle_danger.sum().item()}/{B}")
-
-                integrated_loss = F.binary_cross_entropy(mix, obstacle_danger)
-                #print(f"integrated_loss: {integrated_loss.item():.6f}")
-
-            except Exception as e:
-                print(f"ERROR in integrated network calculation: {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # 10) Backprop: critics, actors+alphas, integrated
-            #print("\n===== DEBUG: STEP 10 - BACKPROP & OPTIMIZATION =====")
-            try:
-                # 1. 크리틱 업데이트 - 분리된 그래프 사용
-                self.opt1.zero_grad()
-                critic1_loss.backward()  # retain_graph 제거
-                critic1_params = list(self.layer1.q1.parameters()) + list(self.layer1.q2.parameters())
-                torch.nn.utils.clip_grad_norm_(critic1_params, max_norm=1.0)
-                self.opt1.step()
-                #print("Critic1 update completed")
-
-                # 2. 액터 업데이트 - 완전히 새로운 계산 그래프 생성
-                self.opt_actor1.zero_grad()
-
-                # 모든 텐서를 새로 생성하여 이전 그래프와 완전히 분리
-                with torch.no_grad():
-                    last_feat1_new = last_feat1.clone()
-
-                # 새 텐서에 requires_grad 설정
-                last_feat1_actor = last_feat1_new.requires_grad_(True)
-
-                # 액터 네트워크로 액션과 로그 확률 계산
-                a1_pi, logp1 = self.layer1.actor.sample(last_feat1_actor)
-
-                # NaN 체크 및 처리
-                if torch.isnan(logp1).any():
-                    logp1 = torch.nan_to_num(logp1, nan=-20.0)
-                    print("WARNING: NaN detected in logp1, replaced")
-
-                # Q 값 계산
-                q1_pi1 = self.layer1.q1(last_feat1_actor, a1_pi)
-                q1_pi2 = self.layer1.q2(last_feat1_actor, a1_pi)
-                q1_pi = torch.min(q1_pi1, q1_pi2).squeeze(-1)
-
-                # 알파 값 계산 (detach 사용)
-                alpha1_actor = self.log_alpha1.detach().exp()
-
-                # 액터 손실 계산
-                actor1_loss = (alpha1_actor * logp1.squeeze(-1) - q1_pi).mean()
-
-                # 역전파
-                actor1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.layer1.actor.parameters(), max_norm=1.0)
-                self.opt_actor1.step()
-                #print("Actor1 update completed")
-
-                # 3. 알파 업데이트 - 별도의 계산 그래프 사용
-                self.alpha_opt1.zero_grad()
-
-                # logp1은 이미 detach됨 (이전 그래프에서 생성됨)
-                alpha1_loss = -(self.log_alpha1 * (logp1.squeeze(-1).detach() + Config.target_entropy)).mean()
-                alpha1_loss.backward()
-                self.alpha_opt1.step()
-                #print("Alpha1 update completed")
-
-                # 4. Layer2 크리틱 업데이트
-                self.opt2.zero_grad()
-                critic2_loss.backward()
-                critic2_params = list(self.layer2.q1.parameters()) + list(self.layer2.q2.parameters())
-                torch.nn.utils.clip_grad_norm_(critic2_params, max_norm=1.0)
-                self.opt2.step()
-                #print("Critic2 update completed")
-
-                # 5. Layer2 액터 업데이트 - 새로운 계산 그래프 생성
-                self.opt_actor2.zero_grad()
-
-                # 새로운 텐서 생성
-                with torch.no_grad():
-                    last_feat2_new = last_feat2.clone()
-
-                # requires_grad 설정
-                last_feat2_actor = last_feat2_new.requires_grad_(True)
-
-                # 액션과 로그 확률 계산
-                a2_pi, logp2 = self.layer2.actor.sample(last_feat2_actor)
-
-                # NaN 체크 및 처리
-                if torch.isnan(logp2).any():
-                    logp2 = torch.nan_to_num(logp2, nan=-20.0)
-                    print("WARNING: NaN detected in logp2, replaced")
-
-                # Q 값 계산
-                q2_pi1 = self.layer2.q1(last_feat2_actor, a2_pi)
-                q2_pi2 = self.layer2.q2(last_feat2_actor, a2_pi)
-                q2_pi = torch.min(q2_pi1, q2_pi2).squeeze(-1)
-
-                # 알파 값 계산
-                alpha2_actor = self.log_alpha2.detach().exp()
-
-                # 액터 손실 계산
-                actor2_loss = (alpha2_actor * logp2.squeeze(-1) - q2_pi).mean()
-
-                # 역전파
-                actor2_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.layer2.actor.parameters(), max_norm=1.0)
-                self.opt_actor2.step()
-                #print("Actor2 update completed")
-
-                # 6. Layer2 알파 업데이트
-                self.alpha_opt2.zero_grad()
-                alpha2_loss = -(self.log_alpha2 * (logp2.squeeze(-1).detach() + Config.target_entropy)).mean()
-                alpha2_loss.backward()
-                self.alpha_opt2.step()
-                #print("Alpha2 update completed")
-
-                # 7. 통합 네트워크 업데이트 - 별도의 계산 그래프 사용
-                self.opt_integrated.zero_grad()
-
-                # 분리된 계산 그래프 사용
-                with torch.no_grad():
-                    last_feat1_int = last_feat1.clone()
-                    last_feat2_int = last_feat2.clone()
-
-                mix = self.integrated(last_feat1_int, last_feat2_int)
-                obstacle_danger = (r_ev < 0).float().unsqueeze(-1)
-
-                integrated_loss = F.binary_cross_entropy(mix, obstacle_danger)
-                integrated_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.integrated.parameters(), max_norm=1.0)
-                self.opt_integrated.step()
-                #print("Integrated network update completed")
-
-                # 타겟 네트워크 소프트 업데이트
-                self.soft_update(self.layer1.q1, self.target_q1_1)
-                self.soft_update(self.layer1.q2, self.target_q1_2)
-                self.soft_update(self.layer2.q1, self.target_q2_1)
-                self.soft_update(self.layer2.q2, self.target_q2_2)
-                #print("Target networks soft-updated")
-
-            except Exception as e:
-                print(f"ERROR in backprop & optimization: {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # 11) PER update
-            #print("\n===== DEBUG: STEP 11 - PER UPDATE =====")
-            try:
-                # TD 오류를 사용한 우선순위 업데이트
-                td_errors = [
-                    [float(abs(q11[i].item() - target1[i].item()))]
-                    for i in range(B)
-                ]
-
-                buffer.update_priorities(indices, td_errors)
-                #print(f"Priority update completed for {len(indices)} indices")
-
-            except Exception as e:
-                print(f"ERROR in PER update: {e}")
-                import traceback
-                traceback.print_exc()
-                return None
-
-            # 최종 결과 반환
-            return {
-                'loss_evade': critic1_loss.item(),
-                'policy_evade': actor1_loss.item(),
-                'alpha_evade': self.log_alpha1.exp().item(),
-                'loss_approach': critic2_loss.item(),
-                'policy_approach': actor2_loss.item(),
-                'alpha_approach': self.log_alpha2.exp().item(),
-                'loss_integrated': integrated_loss.item()
-            }
-
-        except Exception as e:
-            print(f"CRITICAL ERROR in update function: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-    def save_checkpoint(self, episode):
-        """모델 체크포인트 저장"""
-        if not os.path.exists(Config.model_dir):
-            os.makedirs(Config.model_dir)
-
-        checkpoint = {
-            'layer1': self.layer1.state_dict(),
-            'layer2': self.layer2.state_dict(),
-            'integrated': self.integrated.state_dict(),
-            'target_q1_1': self.target_q1_1.state_dict(),
-            'target_q1_2': self.target_q1_2.state_dict(),
-            'target_q2_1': self.target_q2_1.state_dict(),
-            'target_q2_2': self.target_q2_2.state_dict(),
-            'log_alpha1': self.log_alpha1,
-            'log_alpha2': self.log_alpha2,
-            'episode' : episode
+        return {
+            'critic_loss': critic_loss.item(),
+            'actor_loss': actor_loss.item(),
+            'alpha': self.log_alpha.exp().item()
         }
-
-        filename = f"rsac_ep{episode}.pt"
-        filepath = os.path.join(Config.model_dir, filename)
-
-        # 최신 모델 저장
-        latest_filepath = os.path.join(Config.model_dir, f"rsac_latest.pt")
-        torch.save(checkpoint, latest_filepath)
-
-        print(f"모델 체크포인트 저장 완료: {filepath}")
-
-    def load_state_dict(self, checkpoint):
-
-
-        if isinstance(checkpoint, str):
-            state_dict = torch.load(checkpoint, map_location=Config.device, weights_only=False)
-
-        """저장된 상태 딕셔너리로부터 모델 로드"""
-        self.layer1.load_state_dict(state_dict['layer1'])
-        self.layer2.load_state_dict(state_dict['layer2'])
-        self.integrated.load_state_dict(state_dict['integrated'])
-        self.target_q1_1.load_state_dict(state_dict['target_q1_1'])
-        self.target_q1_2.load_state_dict(state_dict['target_q1_2'])
-        self.target_q2_1.load_state_dict(state_dict['target_q2_1'])
-        self.target_q2_2.load_state_dict(state_dict['target_q2_2'])
-        self.log_alpha1 = state_dict['log_alpha1']
-        self.log_alpha2 = state_dict['log_alpha2']
-
-        return state_dict['episode']
-
 
 # 라이다 데이터를 깊이 이미지로 변환
 def lidar_to_depth_image(lidar_points, height=Config.depth_image_height,
@@ -1267,11 +532,12 @@ class DroneEnv:
         return depth_image, drone_state
 
     def step(self, action):
+
         # 액션 적용 (vx, vy, vz 속도)
         vx, vy, vz = action
 
         # AirSim에서는 NED 좌표계 사용
-        self.client.moveByVelocityBodyFrameAsync(
+        self.client.moveByVelocityAsync(
             float(vx),
             float(vy),
             float(vz),  # AirSim에서 z는 아래 방향이 양수
@@ -1282,49 +548,128 @@ class DroneEnv:
         depth_image, state, position = self._get_state()
 
         # 보상과 종료 여부 계산
-        reward_evade, reward_approach, done, info = self._compute_reward(depth_image, state, position)
+        reward, done, info = self._compute_reward(depth_image, state, position)
 
         # 스텝 카운터 증가
         self.steps += 1
 
+        #self.visualize_3d_lidar(depth_image, show=True)
+
         # 최대 스텝 수 초과 시 종료
         if self.steps >= Config.max_episode_steps:
+            print(f"timeout: {position}")
             done = True
             info['timeout'] = True
 
-        return depth_image, state, reward_evade, reward_approach, done, info
+        return depth_image, state, reward, done, info
 
-    def _get_lidar_data(self, euler):
-        lidar_data = self.client.getLidarData("LidarSensor1", "HelloDrone").point_cloud
+    def visualize_3d_lidar(self, depth_image, frame_count=0, show=True, save_path=None):
+        """
+        깊이 이미지의 3D 시각화 (학습 중 실시간 모니터링용)
+        depth_image: 현재 라이다 깊이 이미지
+        frame_count: 현재 프레임 번호 (표시용)
+        show: 화면에 표시 여부
+        save_path: 저장 경로 (None이면 저장하지 않음)
+        """
+        if not hasattr(self, 'lidar_fig') or self.lidar_fig is None:
+            # 처음 호출 시 그림 초기화
+            plt.ion()  # 대화형 모드 활성화
+            self.lidar_fig = plt.figure(figsize=(10, 8))
+            self.lidar_ax = self.lidar_fig.add_subplot(111, projection='3d')
+            self.lidar_scatter = None
+            self.drone_point = None
 
-        if len(lidar_data) >= 3:
-            # 롤, 피치 각도 가져오기
-            roll, pitch = euler[0], euler[1]
+        # 이전 산점도 제거
+        if self.lidar_scatter:
+            self.lidar_scatter.remove()
+        if self.drone_point:
+            self.drone_point.remove()
 
-            # 회전 행렬 계산
-            Rx = np.array([
-                [1, 0, 0],
-                [0, np.cos(-roll), -np.sin(-roll)],
-                [0, np.sin(-roll), np.cos(-roll)]
-            ])
+        # 각도 설정
+        x_size, y_size = Config.depth_image_width, Config.depth_image_height
+        az = np.linspace(-np.pi, np.pi, x_size)
+        el = np.linspace(np.pi / 2, -np.pi / 2, y_size)
+        AZ, EL = np.meshgrid(az, el)
 
-            Ry = np.array([
-                [np.cos(-pitch), 0, np.sin(-pitch)],
-                [0, 1, 0],
-                [-np.sin(-pitch), 0, np.cos(-pitch)]
-            ])
+        # 깊이 값 변환
+        R = depth_image * Config.max_lidar_distance
 
-            R_horizontal = np.dot(Ry, Rx)
+        # 표시할 데이터 수 줄이기 (성능 향상)
+        skip = 4  # 4개마다 하나씩 표시
+
+        # 구면 좌표를 3D 직교 좌표로 변환
+        X = R[::skip, ::skip] * np.cos(EL[::skip, ::skip]) * np.cos(AZ[::skip, ::skip])
+        Y = R[::skip, ::skip] * np.cos(EL[::skip, ::skip]) * np.sin(AZ[::skip, ::skip])
+        Z = R[::skip, ::skip] * np.sin(EL[::skip, ::skip])
+
+        # 데이터 평탄화
+        X_flat = X.flatten()
+        Y_flat = Y.flatten()
+        Z_flat = Z.flatten()
+        depth_flat = depth_image[::skip, ::skip].flatten()
+
+        mask = depth_flat < 1.0
+        X_plot = X_flat[mask]
+        Y_plot = Y_flat[mask]
+        Z_plot = Z_flat[mask]
+        colors = depth_flat[mask]
+
+        self.lidar_scatter = self.lidar_ax.scatter(
+            X_plot, Y_plot, Z_plot,
+            c=colors,
+            cmap='viridis_r',
+            s=3,
+            alpha=0.8,
+            marker='.'
+        )
+
+        # 드론 위치 표시
+        self.drone_point = self.lidar_ax.scatter([0], [0], [0], color='red', s=50, marker='o')
+
+        # 축 설정
+        self.lidar_ax.set_title(f'Training Step: {frame_count}')
+        self.lidar_ax.set_xlabel('North (m)')
+        self.lidar_ax.set_ylabel('East (m)')
+        self.lidar_ax.set_zlabel('Down (m)')
+
+        # 축 범위 설정
+        max_vis_range = Config.max_lidar_distance / 2
+        self.lidar_ax.set_xlim([-max_vis_range, max_vis_range])
+        self.lidar_ax.set_ylim([-max_vis_range, max_vis_range])
+        self.lidar_ax.set_zlim([-max_vis_range, max_vis_range])
+
+        # 화면 업데이트 (학습 속도에 영향을 최소화하기 위해 빠르게 처리)
+        if show:
+            self.lidar_fig.canvas.draw_idle()
+            plt.pause(0.001)  # 매우 짧은 일시 중지
+
+        # 프레임 저장
+        if save_path:
+            plt.savefig(save_path)
+
+        return self.lidar_fig
+
+    def _get_lidar_data(self):
+        lidar_data = self.client.getLidarData("LidarSensor1", "HelloDrone")
+        lidar_points = lidar_data.point_cloud
+        pose = lidar_data.pose
+
+        if len(lidar_points) >= 3:
 
             # 모든 포인트를 numpy 배열로 변환 (벡터화)
-            points_count = len(lidar_data) // 3
-            points = np.array(lidar_data).reshape(points_count, 3)
+            points_count = len(lidar_points) // 3
+            points = np.array(lidar_points).reshape(points_count, 3)
 
-            # 모든 포인트를 한 번에 변환 (빠른 행렬곱)
-            corrected_points = np.dot(points, R_horizontal.T)
+            qw, qx, qy, qz = pose.orientation.w_val, pose.orientation.x_val, pose.orientation.y_val, pose.orientation.z_val
+
+            # ③ 쿼터니언 → 회전 행렬
+            R = self._quaternion_to_rotation_matrix(qw, qx, qy, qz)
+
+            # 역행렬(전치행렬)을 사용하여 body에서 NED로 변환
+            pts_ned = points @ R.T
 
             # 변환된 포인트를 튜플 리스트로 변환
-            points_list = [tuple(point) for point in corrected_points]
+            points_list = [tuple(point) for point in pts_ned]
 
             return lidar_to_depth_image(points_list)
 
@@ -1334,24 +679,9 @@ class DroneEnv:
         # 드론 상태와 방향 가져오기
         kinematics = self.client.simGetGroundTruthKinematics()
         position = np.array([kinematics.position.x_val, kinematics.position.y_val, kinematics.position.z_val])
-        orientation = kinematics.orientation
-
-        # 쿼터니언을 오일러 각도로 변환
-        euler = self._quaternion_to_euler(
-            np.array([orientation.w_val, orientation.x_val, orientation.y_val, orientation.z_val])
-        )
-
-        # 요(yaw)만 고려한 회전 행렬
-        yaw = euler[2]
-        yaw_rotation_matrix = np.array([
-            [np.cos(yaw), -np.sin(yaw), 0],
-            [np.sin(yaw), np.cos(yaw), 0],
-            [0, 0, 1]
-        ])
 
         # 라이다 데이터에서 깊이 이미지 가져오기
-        depth_image = self._get_lidar_data(euler)
-
+        depth_image = self._get_lidar_data()
 
         # 속도 가져오기 (NED 좌표계)
         velocity_ned = np.array([
@@ -1363,12 +693,8 @@ class DroneEnv:
         # NED 좌표계에서 목표까지의 상대 벡터
         relative_goal_ned = self.goal_position - position
 
-        # NED 속도와 상대 목표 위치를 바디 프레임으로 변환
-        velocity_body = np.dot(yaw_rotation_matrix.T, velocity_ned)
-        relative_goal_body = np.dot(yaw_rotation_matrix.T, relative_goal_ned)
-
         # 바디 프레임 기준 상태 벡터: 속도(3), 목표 상대 위치(3), 드론 pose(3)
-        drone_state = np.concatenate([velocity_body, relative_goal_body, euler])
+        drone_state = np.concatenate([velocity_ned, relative_goal_ned])
 
         return depth_image, drone_state, position
 
@@ -1381,119 +707,111 @@ class DroneEnv:
         ])
         return rotation_matrix
 
-    def _quaternion_to_euler(self, q):
-        """쿼터니언에서 오일러 각도로 변환"""
+    def _rotate_by_quaternion(self, point, q):
+        """쿼터니언을 사용하여 점을 회전"""
         w, x, y, z = q
+        point_q = np.array([0, point[0], point[1], point[2]])
 
-        # 롤 (x축 회전)
-        sinr_cosp = 2 * (w * x + y * z)
-        cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
+        # 쿼터니언 곱셈을 사용한 회전
+        q_conj = np.array([w, -x, -y, -z])
+        rotated = self._quaternion_multiply(self._quaternion_multiply(q, point_q), q_conj)
 
-        # 피치 (y축 회전)
-        sinp = 2 * (w * y - z * x)
-        if abs(sinp) >= 1:
-            pitch = math.copysign(math.pi / 2, sinp)  # 90도로 제한
-        else:
-            pitch = math.asin(sinp)
+        return rotated[1:]  # 벡터 부분만 반환
 
-        # 요 (z축 회전)
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
+    def _quaternion_multiply(self, q1, q2):
+        """두 쿼터니언의 곱셈"""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
 
-        return np.array([roll, pitch, yaw])
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+        return np.array([w, x, y, z])
 
     def _compute_reward(self, depth_image, drone_state, position):
-        # 현재 위치와 목표 위치
+        # 현재 위치와 목표 위치 거리
         current_goal_distance = np.linalg.norm(drone_state[3:6])
 
-        # 충돌 확인
+        # 충돌 정보
         collision_info = self.client.simGetCollisionInfo()
         has_collided = collision_info.has_collided
 
+        # 최소 깊이 계산 (가장 가까운 장애물 거리)
+        min_depth = np.min(depth_image) * Config.max_lidar_distance
+
         # 보상 초기화
-        reward_evade = 0  # 장애물 회피 보상
-        reward_approach = 0  # 내비게이션 보상
-
-        info = {
-            "distance_to_goal": current_goal_distance,
-            "prev_distance": self.prev_goal_distance
-        }
-
+        reward = 0.0
         done = False
 
-        # 목표 도달 확인
+        # 터미널 상태 처리
         if current_goal_distance < Config.goal_threshold:
-            print(f"Goal reached at position: {position}")
-            reward_approach += 100.0  # 목표 도달 큰 보상
+            reward = 50.0  # 목표 도달 보너스 (더 큰 값)
             done = True
-            info["status"] = "goal_reached"
-
-        # 충돌 확인
+            info = {"status": "goal_reached", "distance_to_goal": current_goal_distance}
+            print(f"Reached: {position}")
         elif has_collided:
-            print(f"Collision at position: {position}")
-            reward_evade -= 100.0  # 충돌 큰 페널티
-            done = True
-            info["status"] = "collision"
-
-        # 일반 이동 중 보상
+            reward = -50.0  # 충돌 페널티 (더 큰 부정값)
+            if self.steps > 200:
+                done = True
+            info = {"status": "collision", "distance_to_goal": current_goal_distance}
+            print(f"Collided: {position}")
         else:
-            # --- 장애물 회피(Evade) 보상 ---
-            min_depth = np.min(depth_image) * Config.max_lidar_distance
+            # 지속적인 보상 계산 (비터미널 상태)
 
-            # 안전 거리 임계값
-            safety_threshold = 3.0  # 미터
-            danger_threshold = 1.5  # 미터
+            # 1. 목표 접근 보상: 이전 거리와 현재 거리의 차이 (진전 보상)
+            progress_reward = (self.prev_goal_distance - current_goal_distance) * 10.0
 
-            # 장애물이 가까울수록 페널티, 멀수록 보상
-            if min_depth < safety_threshold:
-                # 선형 보간: 안전 거리에서는 작은 페널티, 위험 거리에서는 큰 페널티
-                obstacle_penalty = -3.0 * (1.0 - (min_depth - danger_threshold) /
-                                           (safety_threshold - danger_threshold))
-                obstacle_penalty = max(obstacle_penalty, -3.0)  # 최대 페널티 제한
-                reward_evade += obstacle_penalty
+            # 3. 장애물 회피 보상: 안전 거리에 따른 보상/페널티
+            danger_zone = 2.0
+            caution_zone = 5.0
+
+            if min_depth < danger_zone:
+                # 매우 위험한 상황 (강한 페널티)
+                obstacle_reward = -2.0 * ((danger_zone - min_depth) / danger_zone)
+            elif min_depth < caution_zone:
+                # 주의 구역 (약한 페널티)
+                obstacle_reward = -0.5 * ((caution_zone - min_depth) / (caution_zone - danger_zone))
             else:
-                # 장애물이 충분히 멀 경우 작은 보상
-                reward_evade += 0.1
+                # 안전 구역 (작은 보상)
+                obstacle_reward = 0.1
 
-            info["obstacle_distance"] = min_depth
+            # 4. 에너지 효율성 보상: 최적 속도 유지 장려
+            speed = np.linalg.norm(drone_state[:3])
+            optimal_speed = Config.max_drone_speed * 0.7  # 최대 속도의 70%를 최적으로 가정
+            efficiency_reward = -0.1 * abs(speed - optimal_speed) / optimal_speed
 
-            # --- 내비게이션(Approach) 보상 ---
-            # 목표를 향해 가까워지면 보상, 멀어지면 페널티
-            distance_reward = np.clip(self.prev_goal_distance - current_goal_distance, -1.0, 1.0)
-            reward_approach += distance_reward * 3.0
+            # 5. 시간 패널티: 시간이 지날수록 작은 패널티
+            time_penalty = -0.001 * self.steps
 
-            # 시간 패널티 (빠른 목표 도달 장려)
-            reward_approach -= 0.1
+            # 모든 보상 요소 결합
+            reward = progress_reward + obstacle_reward + efficiency_reward + time_penalty
 
-            # 에너지 효율성 (급격한 움직임 패널티)
-            velocity = drone_state[:3]
-            speed = np.linalg.norm(velocity)
+            info = {
+                "status": "moving",
+                "distance_to_goal": current_goal_distance,
+                "obstacle_distance": min_depth,
+                "progress_reward": progress_reward,
+                "obstacle_reward": obstacle_reward
+            }
 
-            # 너무 빠른 속도에 페널티
-            if speed > Config.max_drone_speed:
-                reward_approach -= 0.2 * (speed - Config.max_drone_speed)
-
-            info["status"] = "moving"
-
-        # 현재 목표 거리를 이전 거리로 업데이트
+        # 이전 거리 업데이트
         self.prev_goal_distance = current_goal_distance
 
-        return reward_evade, reward_approach, done, info
+        return reward, done, info
 
 
 # Transition 클래스 정의 - 분리된 보상 구조를 위해 수정
 class Transition:
-    def __init__(self, depth_image, state, action, reward_evade, reward_approach, next_depth_image, next_state, done):
-        self.depth_image = depth_image  # 깊이 이미지
-        self.state = state  # 드론 상태 벡터
-        self.action = action  # 수행한 액션
-        self.reward_evade = reward_evade  # 장애물 회피 보상
-        self.reward_approach = reward_approach  # 목표 접근 보상
-        self.next_depth_image = next_depth_image  # 다음 깊이 이미지
-        self.next_state = next_state  # 다음 드론 상태
-        self.done = done  # 종료 여부
+    def __init__(self, depth_image, state, action, reward, next_depth_image, next_state, done):
+        self.depth_image = depth_image
+        self.state = state
+        self.action = action
+        self.reward = reward  # 단일 보상 값
+        self.next_depth_image = next_depth_image
+        self.next_state = next_state
+        self.done = done
 
 
 # 학습 진행 상황을 추적하는 클래스
@@ -1577,10 +895,10 @@ class TrainingTracker:
 
 
 # 학습 함수
-def train_layered_rsac():
+def train_rsac():
     # 환경, 에이전트, 리플레이 버퍼 초기화
     env = DroneEnv()
-    agent = LayeredRSACAgent()
+    agent = RSACAgent().to(Config.device)
 
     # 리플레이 버퍼 사용
     buffer = PrioritizedSequenceReplayBuffer(capacity=10000, alpha=0.6, burn_in=Config.burn_in)
@@ -1591,113 +909,164 @@ def train_layered_rsac():
     # 모델, 로그 디렉토리 생성
     os.makedirs(Config.model_dir, exist_ok=True)
     os.makedirs(Config.log_dir, exist_ok=True)
+    log_csv_path = os.path.join(Config.log_dir, "training_log.csv")
 
+    # CSV 헤더 작성
+    with open(log_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        csv_writer.writerow([
+            'Episode', 'Steps', 'Duration', 'Reward', 'Avg_Reward',
+            'Status', 'Success_Rate', 'Critic_Loss', 'Actor_Loss', 'Alpha'
+        ])
+
+
+    # 체크포인트 로드 (있을 경우)
     latest_model_path = os.path.join(Config.model_dir, f"rsac_latest.pt")
     start_episode = 0
     if os.path.exists(latest_model_path):
-        episode = agent.load_state_dict(latest_model_path)
-        if episode is not None:
-            start_episode = episode + 1
+        try:
+            checkpoint = torch.load(latest_model_path, map_location=Config.device)
+            agent.load_state_dict(checkpoint['model_state'])
+            start_episode = checkpoint.get('episode', 0) + 1
             print(f"체크포인트 로드 완료: 에피소드 {start_episode}부터 계속")
+        except Exception as e:
+            print(f"체크포인트 로드 실패: {e}")
 
     # 에피소드 반복
     for episode in range(start_episode, Config.max_episodes):
-        # 환경 초기화
-        depth_image, drone_state = env.reset()
+        try:
+            # 환경 초기화
+            depth_image, drone_state = env.reset()
 
-        # 에피소드 상태 저장 변수
-        episode_reward_evade = 0
-        episode_reward_approach = 0
-        episode_reward_total = 0
-        episode_steps = 0
-        episode_transitions = []  # 현재 에피소드의 전이 저장
+            # 에피소드 상태 저장 변수
+            episode_reward = 0
+            episode_steps = 0
+            episode_transitions = []  # 현재 에피소드의 전이 저장
+            episode_critic_losses = []
+            episode_actor_losses = []
+            episode_alphas = []
 
-        # 히든 스테이트 초기화
-        h1 = None
-        h2 = None
 
-        done = False
-        episode_start_time = time.time()
+            # 히든 스테이트 초기화
+            h = None
 
-        # 에피소드 실행
-        while not done and episode_steps < Config.max_episode_steps:
-            # 에이전트로부터 액션 획득
-            with torch.no_grad():
-                # 깊이 이미지 변환 및 상태 전처리
-                depth_tensor = torch.FloatTensor(depth_image).unsqueeze(0).unsqueeze(0).to(Config.device)
-                state_tensor = torch.FloatTensor(drone_state).unsqueeze(0).unsqueeze(0).to(Config.device)
+            done = False
+            episode_start_time = time.time()
 
-                # 시퀀스 형태로 변환
-                if episode_steps == 0:
-                    # 처음 단계인 경우 이미지와 상태를 반복
-                    depth_seq = depth_tensor.repeat(1, Config.seq_length, 1, 1, 1)
-                    state_seq = state_tensor.repeat(1, Config.seq_length, 1)
-                else:
-                    # 아닌 경우 이전 시퀀스에 현재 이미지와 상태 추가
-                    depth_seq = torch.cat([depth_seq[:, 1:], depth_tensor.unsqueeze(1)], dim=1)
-                    state_seq = torch.cat([state_seq[:, 1:], state_tensor], dim=1)
+            # 에피소드 실행
+            while not done and episode_steps < Config.max_episode_steps:
+                # 에이전트로부터 액션 획득
+                with torch.no_grad():
+                    # 깊이 이미지 변환 및 상태 전처리
+                    depth_tensor = torch.FloatTensor(depth_image).unsqueeze(0).unsqueeze(0).to(Config.device)
+                    state_tensor = torch.FloatTensor(drone_state).unsqueeze(0).unsqueeze(0).to(Config.device)
 
-                # 액션 선택 (드론 상태 정보 포함)
-                action_tensor, h1, h2 = agent.select_action(depth_seq, state_seq, h1, h2)
-                action = action_tensor.cpu().numpy()[0]
+                    # 시퀀스 형태로 변환
+                    if episode_steps == 0:
+                        # 처음 단계인 경우 이미지와 상태를 반복
+                        depth_seq = depth_tensor.repeat(1, Config.seq_length, 1, 1, 1)
+                        state_seq = state_tensor.repeat(1, Config.seq_length, 1)
+                    else:
+                        # 아닌 경우 이전 시퀀스에 현재 이미지와 상태 추가
+                        depth_seq = torch.cat([depth_seq[:, 1:], depth_tensor.unsqueeze(1)], dim=1)
+                        state_seq = torch.cat([state_seq[:, 1:], state_tensor], dim=1)
 
-            # 환경에서 한 스텝 진행
-            next_depth_image, next_state, reward_evade, reward_approach, done, info = env.step(action)
+                    # 액션 선택
+                    action_tensor, h = agent.select_action(depth_seq, state_seq, h)
+                    action = action_tensor.cpu().numpy()[0]
 
-            # 총 보상 계산 (논문의 정의에 따라)
-            reward_total = reward_evade + reward_approach
+                # 환경에서 한 스텝 진행 - 단일 보상 값 반환
+                next_depth_image, next_state, reward, done, info = env.step(action)
 
-            # 전이 저장
-            transition = Transition(
-                depth_image, drone_state, action,
-                reward_evade, reward_approach,
-                next_depth_image, next_state, done
-            )
-            episode_transitions.append(transition)
+                # 전이 저장 - 단일 보상 값 사용
+                transition = Transition(
+                    depth_image, drone_state, action,
+                    float(reward),  # 단일 보상 값
+                    next_depth_image, next_state, done
+                )
+                episode_transitions.append(transition)
 
-            # 보상 누적
-            episode_reward_evade += reward_evade
-            episode_reward_approach += reward_approach
-            episode_reward_total += reward_total
-            episode_steps += 1
+                # 보상 누적
+                episode_reward += reward
+                episode_steps += 1
 
-            # 다음 상태로 업데이트
-            depth_image = next_depth_image
-            drone_state = next_state
+                # 다음 상태로 업데이트
+                depth_image = next_depth_image
+                drone_state = next_state
 
-            # 에이전트 업데이트 (정기적으로)
-            if len(buffer) > Config.batch_size:
-                if episode_steps % 10 == 0:  # 10스텝마다 업데이트
-                    update_info = agent.update(buffer)
+                # 에이전트 업데이트 (정기적으로)
+                if len(buffer) > Config.batch_size:
+                    if episode_steps % 10 == 0:  # 10스텝마다 업데이트
+                        update_info = agent.update(buffer)
+                        if update_info:
+                            episode_critic_losses.append(update_info['critic_loss'])
+                            episode_actor_losses.append(update_info['actor_loss'])
+                            episode_alphas.append(update_info['alpha'])
 
-        # 에피소드가 끝나면 전이를 리플레이 버퍼에 추가
-        if episode_transitions:
-            buffer.push(episode_transitions)
+            # 에피소드가 끝나면 전이를 리플레이 버퍼에 추가
+            if episode_transitions:
+                buffer.push(episode_transitions)
 
-        # 에피소드 통계 기록
-        episode_duration = time.time() - episode_start_time
-        status = info.get("status", "unknown")
+            # 에피소드 통계 기록
+            avg_critic_loss = np.mean(episode_critic_losses) if episode_critic_losses else 0
+            avg_actor_loss = np.mean(episode_actor_losses) if episode_actor_losses else 0
+            avg_alpha = np.mean(episode_alphas) if episode_alphas else 0
+            episode_duration = time.time() - episode_start_time
+            status = info.get("status", "unknown")
 
-        tracker.add_episode_stats(episode_reward_total, episode_steps, status)
-        avg_reward, success_rate = tracker.get_recent_stats()
+            tracker.add_episode_stats(episode_reward, episode_steps, status)
+            avg_reward, success_rate = tracker.get_recent_stats()
 
-        # 로그 출력
-        if episode % Config.log_interval == 0:
-            print(f"Episode {episode}: " +
-                  f"Time={episode_duration:.2f}s, Steps ={episode_steps}, " +
-                  f"Avg Reward={avg_reward:.2f}, Status={info['status']}")
+            # 로그 출력
+            if episode % Config.log_interval == 0:
+                print(f"Episode {episode}: " +
+                      f"Time={episode_duration:.2f}s, Steps={episode_steps}, " +
+                      f"Reward={episode_reward:.2f}, Avg Reward={avg_reward:.2f}, Status={status}")
+
+                # 로그 파일에 기록 (CSV)
+                with open(log_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+                    csv_writer = csv.writer(csvfile)
+                    csv_writer.writerow([
+                        episode, episode_steps, f"{episode_duration:.2f}",
+                        f"{episode_reward:.2f}", f"{avg_reward:.2f}",
+                        status, f"{success_rate:.4f}",
+                        f"{avg_critic_loss:.4f}", f"{avg_actor_loss:.4f}", f"{avg_alpha:.4f}"
+                    ])
             print()
 
-        # 모델 저장
-        if episode % Config.save_interval == 0:
-            agent.save_checkpoint(episode)
+            # 모델 저장
+            if episode % Config.save_interval == 0:
+                # 모델 저장
+                checkpoint = {
+                    'model_state': agent.state_dict(),
+                    'episode': episode
+                }
+                latest_filepath = os.path.join(Config.model_dir, f"rsac_latest.pt")
+                torch.save(checkpoint, latest_filepath)
 
-            # 학습 진행 그래프 저장
-            graph_path = os.path.join(Config.log_dir, f"training_progress_ep{episode}.png")
-            tracker.plot_training_progress(save_path=graph_path)
+                # 특정 에피소드 체크포인트 저장
+                ep_filepath = os.path.join(Config.model_dir, f"rsac_ep{episode}.pt")
+                torch.save(checkpoint, ep_filepath)
+
+                print(f"모델 체크포인트 저장 완료: {ep_filepath}")
+
+                # 학습 진행 그래프 저장
+                graph_path = os.path.join(Config.log_dir, f"training_progress_ep{episode}.png")
+                tracker.plot_training_progress(save_path=graph_path)
+
+        except Exception as e:
+            print(f"에피소드 {episode} 실행 중 오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
+            # 오류 발생해도 계속 진행
 
     # 최종 모델 저장
-    agent.save_checkpoint(Config.max_episodes)
+    checkpoint = {
+        'model_state': agent.state_dict(),
+        'episode': Config.max_episodes - 1
+    }
+    final_filepath = os.path.join(Config.model_dir, f"rsac_final.pt")
+    torch.save(checkpoint, final_filepath)
 
     # 최종 학습 진행 그래프 저장
     final_graph_path = os.path.join(Config.log_dir, "training_progress_final.png")
@@ -1710,7 +1079,7 @@ def train_layered_rsac():
 # 메인 함수
 if __name__ == "__main__":
     # 학습 시작
-    trained_agent, training_stats = train_layered_rsac()
+    trained_agent, training_stats = train_rsac()
 
     # 최종 결과 출력
     final_avg_reward, final_success_rate = training_stats.get_recent_stats()
