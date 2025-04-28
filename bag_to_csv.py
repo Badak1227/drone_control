@@ -23,13 +23,13 @@ from torchvision import models
 class Config:
     # 환경 설정
     max_episode_steps = 1000
-    max_episodes = 3000
-    goal_threshold = 3.0  # 목표 도달 판정 거리 (미터)
+    max_episodes = 1000
+    goal_threshold = 1.0  # 목표 도달 판정 거리 (미터)
     max_drone_speed = 5.0  # 최대 허용 속도 (m/s)
 
     # 라이다 및 깊이 이미지 설정
-    depth_image_height = 84
-    depth_image_width = 84
+    depth_image_height = 42
+    depth_image_width = 42
     max_lidar_distance = 50.0  # 최대 라이다 감지 거리 (미터)
 
     # 신경망 및 학습 설정
@@ -45,9 +45,7 @@ class Config:
     prior_sigma = 0.45  # 논문에서 최적으로 제시된 값
     prior_decay_rate = 0.00005  # 경험 감쇠율
 
-    batch_size = 16
-    burn_in = 16
-    seq_length = 32
+    batch_size = 32
     action_dim = 3
     max_action = 5.0
     target_entropy = -3  # -action_dim으로 수정 (엔트로피 타겟)
@@ -61,109 +59,98 @@ class Config:
     model_dir = "models"
     log_dir = "logs"
 
+# Transition 클래스 정의 - 분리된 보상 구조를 위해 수정
+class Transition:
+    def __init__(self, depth_image, state, action, reward, next_depth_image, next_state, done):
+        self.depth_image = depth_image
+        self.state = state
+        self.action = action
+        self.reward = reward  # 단일 보상 값
+        self.next_depth_image = next_depth_image
+        self.next_state = next_state
+        self.done = done
 
 # --- Prioritized Experience Replay for Sequences ---
-class PrioritizedSequenceReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, burn_in=16):
-        """
-        capacity: Maximum number of episodes
-        alpha: Priority scaling factor
-        burn_in: Warm-up steps
-        """
+class PrioritizedTransitionReplayBuffer:
+    """
+    Prioritized Experience Replay for single-step Transitions.
+    Stores transitions (depth_image, state, action, reward, next_depth_image, next_state, done)
+    """
+    def __init__(self, capacity: int, alpha: float = 0.6):
         self.capacity = capacity
         self.alpha = alpha
-        self.burn_in = burn_in
-
         self.buffer = []
         self.priorities = np.zeros((capacity,), dtype=np.float32)
         self.pos = 0
 
-    def push(self, episode_transitions):
-        """Add one episode (list of transitions) to the buffer"""
+    def push(self, depth, state, action, reward, next_depth, next_state, done):
+        depth = torch.from_numpy(depth).float()
+        state = torch.from_numpy(state).float()
+        next_depth = torch.from_numpy(next_depth).float()
+        next_state = torch.from_numpy(next_state).float()
+        transition = Transition(depth, state, action, reward, next_depth, next_state, done)
+
         max_prio = self.priorities.max() if self.buffer else 1.0
         if len(self.buffer) < self.capacity:
-            self.buffer.append(episode_transitions)
-            self.priorities[len(self.buffer) - 1] = max_prio
+            self.buffer.append(transition)
         else:
-            self.buffer[self.pos] = episode_transitions
-            self.priorities[self.pos] = max_prio
-            self.pos = (self.pos + 1) % self.capacity
+            self.buffer[self.pos] = transition
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
 
-    def sample(self, batch_size, seq_length):
+    def sample(self, batch_size: int, beta: float = 0.4):
         """
-        Sample batch_size sequences of (burn_in + learning) length with PER
+        Sample a batch of transitions with Prioritized Replay.
         Returns:
-          sequences:   list of lists of transitions, len=batch_size
-          indices:     list of indices in buffer (batch_size)
-          is_weights:  importance sampling weights (batch_size,)
+          batch: list of transitions
+          indices: list of sampled indices
+          weights: numpy array of shape [batch_size]
         """
         if len(self.buffer) == 0:
             return [], [], []
-
-        # PER probability distribution
         prios = self.priorities[:len(self.buffer)] ** self.alpha
-        total = prios.sum()
-
-        if not np.isfinite(total) or total <= 0:
-            probs = np.ones_like(prios, dtype=np.float32) / len(prios)
-        else:
-            probs = prios / total
-        # Sample episode indices
+        probs = prios / prios.sum()
         indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-        is_weights = (len(self.buffer) * probs[indices]) ** -1
-        is_weights /= is_weights.max()  # Normalize to [0,1]
+        samples = [self.buffer[i] for i in indices]
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        return samples, indices, weights
 
-        sequences = []
-        for idx in indices:
-            ep = self.buffer[idx]
-            L = len(ep)
-            # If sequence length is insufficient, use only burn-in part and pad the rest
-            if L >= seq_length:
-                start = random.randint(0, L - seq_length)
-                seq = ep[start: start + seq_length]
-            else:
-                # Pad with last transition
-                pad_n = seq_length - L
-                seq = ep + [ep[-1]] * pad_n
-
-            sequences.append(seq)
-
-        return sequences, indices.tolist(), is_weights
-
-    def update_priorities(self, indices, td_errors, eps=1e-6):
-        """Update priorities after sampling using max TD-error of each sequence"""
-        for idx, errors in zip(indices, td_errors):
-            arr = np.array(errors, dtype=np.float32).flatten()
-            max_err = float(np.max(np.abs(arr)))
-            self.priorities[idx] = max_err + eps
+    def update_priorities(self, indices, td_errors, eps: float = 1e-6):
+        """
+        Update priorities of sampled transitions.
+        td_errors: list or array of floats (absolute TD errors)
+        """
+        for idx, err in zip(indices, td_errors):
+            self.priorities[idx] = abs(err) + eps
 
     def __len__(self):
         return len(self.buffer)
 
 
 # --- CNN Feature Extractor ---
-class SimpleCNNFeatureExtractor(nn.Module):
-    def __init__(self, output_dim=256):
+class CNNFeatureExtractor(nn.Module):
+    def __init__(self, in_channels=4, output_dim=128):  # 출력 차원 축소
         super().__init__()
-        # 더 간단한 CNN 구조
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        # 더 효율적인 커널 크기와 채널 수
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=5, stride=2, padding=2)  # 유지 크기
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
 
-        # 특징 맵 크기 계산 (84x84 입력 기준)
-        # 첫 번째 층 이후: (84-8)/4+1 = 20
-        # 두 번째 층 이후: (20-4)/2+1 = 9
-        # 세 번째 층 이후: (9-3)/1+1 = 7
-        # 따라서 최종 특징 맵 크기는 7x7x64 = 3136
+        # 특징 풀링으로 차원 축소
+        self.pool = nn.AdaptiveAvgPool2d((5, 5))
 
-        self.fc = nn.Linear(7 * 7 * 64, output_dim)
-        self.bn = nn.BatchNorm1d(output_dim)
+        # 최종 FC 레이어
+        self.fc = nn.Linear(32 * 5 * 5, output_dim)
+        self.bn = nn.LayerNorm(output_dim)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)  # 평탄화
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
         x = self.fc(x)
         x = self.bn(x)
         return F.relu(x)
@@ -230,34 +217,36 @@ class QNetwork(nn.Module):
 
 # --- Agent ---
 class RSACAgent(nn.Module):
-    def __init__(self, state_dim=6):  # 자세 정보 제외한 상태 차원
+    def __init__(self, state_dim=6):
         super().__init__()
-        # 특징 추출
-        self.cnn = SimpleCNNFeatureExtractor(output_dim=256)
-        self.cnn_bn = nn.BatchNorm1d(256)
+        # 더 작은 출력 차원으로 CNN 특징 추출기 초기화
+        self.cnn = CNNFeatureExtractor(output_dim=128)
+        self.cnn_bn = nn.LayerNorm(128)
 
-        # 상태 처리
-        self.state_fc = nn.Linear(state_dim, 128)
-        self.state_bn = nn.BatchNorm1d(128)
+        # 상태 처리 - 더 작은 차원
+        self.state_fc = nn.Linear(state_dim, 64)
+        self.state_bn = nn.LayerNorm(64)
 
-        # GRU 사용
-        self.rnn = nn.GRU(256 + 128, 256, batch_first=True)
+        # 결합 특징 차원 축소
+        self.shared_fc1 = nn.Linear(128 + 64, 128)
+        self.shared_fc2 = nn.Linear(128, 128)
 
-        # 액터 & 크리틱
-        self.actor = PolicyNetwork(256, Config.action_dim, Config.max_action)
-        self.q1 = QNetwork(256, Config.action_dim)
-        self.q2 = QNetwork(256, Config.action_dim)
+        # 액터 & 크리틱 (더 작은 입력 차원)
+        self.actor = PolicyNetwork(128, Config.action_dim, Config.max_action)
+        self.q1 = QNetwork(128, Config.action_dim)
+        self.q2 = QNetwork(128, Config.action_dim)
 
         # 타겟 크리틱
-        self.target_q1 = QNetwork(256, Config.action_dim)
-        self.target_q2 = QNetwork(256, Config.action_dim)
+        self.target_q1 = QNetwork(128, Config.action_dim)
+        self.target_q2 = QNetwork(128, Config.action_dim)
         self._copy_weights()
 
         # 최적화기
         self.opt_critic = optim.Adam(
             list(self.cnn.parameters()) +
             list(self.state_fc.parameters()) +
-            list(self.rnn.parameters()) +
+            list(self.shared_fc1.parameters()) +
+            list(self.shared_fc2.parameters()) +
             list(self.q1.parameters()) +
             list(self.q2.parameters()),
             lr=Config.lr_critic
@@ -272,170 +261,161 @@ class RSACAgent(nn.Module):
         for p, tp in zip(self.q2.parameters(), self.target_q2.parameters()):
             tp.data.copy_(p.data)
 
-    def forward(self, obs_seq, state_seq, h=None, evaluate=False):
-        B, L, C, H, W = obs_seq.shape
-
-        # CNN 특징 추출 및 정규화
-        x_img = obs_seq.reshape(B * L, C, H, W)
-        feats_img = self.cnn(x_img)
-        feats_img = self.cnn_bn(feats_img)
-        feats_img = feats_img.reshape(B, L, -1)
-
-        # 상태 특징 추출 및 정규화
-        x_st = state_seq.reshape(B * L, -1)
-        feats_st = self.state_fc(x_st)
-        feats_st = self.state_bn(feats_st)
-        feats_st = F.relu(feats_st).reshape(B, L, -1)
-
-        # 특징 결합
-        feats = torch.cat([feats_img, feats_st], dim=-1)
-
-        # GRU 처리
-        if h is None:
-            h = torch.zeros(1, B, 256, device=Config.device)
-        out, h_new = self.rnn(feats, h)
-        last = out[:, -1]
+    def forward(self, depth, state, evaluate=False):
+        # CNN 특징
+        feat_img = self.cnn(depth)  # (B,256)
+        feat_img = self.cnn_bn(feat_img)
+        # State 특징
+        feat_st = F.relu(self.state_bn(self.state_fc(state)))  # (B,128)
+        # 결합 → 공유 MLP
+        x = torch.cat([feat_img, feat_st], dim=-1)  # (B,384)
+        x = F.relu(self.shared_fc1(x))
+        shared_feat = F.relu(self.shared_fc2(x))  # (B,256)
 
         if evaluate:
-            action = self.actor.get_action(last)
-            return action, h_new
+            action = self.actor.get_action(shared_feat)
+            return action
         else:
-            action, logp = self.actor.sample(last)
-            return action, logp, last, h_new
+            action, logp = self.actor.sample(shared_feat)
+            return action, logp
 
 
-    def select_action(self, obs_seq, state_seq, h=None, evaluate=False):
+    def select_action(self, depth, state, evaluate=False):
         with torch.no_grad():
             if evaluate:
-                action, h_new = self.forward(obs_seq, state_seq, h, True)
-                return action, h_new
+                action = self.forward(depth, state, True)
+                return action
             else:
-                action, _, _, h_new = self.forward(obs_seq, state_seq, h, False)
-                return action, h_new
+                action, _= self.forward(depth, state, False)
+                return action
 
-    def update(self, buffer):
-        seqs, idxs, isw = buffer.sample(Config.batch_size, Config.seq_length)
-        if not seqs: return
+    def update(self, buffer, beta=0.4):
+        """
+        SAC 알고리즘의 최적화된 업데이트 함수
+        - 메모리 효율성 개선
+        - 텐서 차원 일관성 유지
+        - 계산 그래프 분리로 역전파 오류 방지
+        """
+        transitions, indices, is_weights = buffer.sample(Config.batch_size, beta)
+        if not transitions:
+            return {}
 
-        # 텐서 변환 시 명시적으로 float32 타입 사용
-        obs_seq = torch.stack(
-            [torch.stack([torch.from_numpy(np.array(t.depth_image, dtype=np.float32)) for t in s], 0) for s in seqs])
-        obs_seq = obs_seq.unsqueeze(2).to(Config.device)
-        state_seq = torch.stack(
-            [torch.stack([torch.from_numpy(np.array(t.state, dtype=np.float32)) for t in s], 0) for s in seqs])
-        state_seq = state_seq.to(Config.device)
+        device = Config.device
 
-        bi = Config.burn_in
-        obs_b, obs_l = obs_seq[:, :bi], obs_seq[:, bi:]
-        st_b, st_l = state_seq[:, :bi], state_seq[:, bi:]
+        # 1. 효율적인 배치 텐서 생성
+        depths = torch.stack([t.depth_image for t in transitions]).to(device)
+        states = torch.stack([t.state for t in transitions]).to(device)
+        next_depths = torch.stack([t.next_depth_image for t in transitions]).to(device)
+        next_states = torch.stack([t.next_state for t in transitions]).to(device)
 
-        # burn-in GRU - 배치 정규화 적용
-        h0 = torch.zeros(1, Config.batch_size, 256, device=Config.device)
+        # NumPy 배열 중간 변환으로 효율성 향상
+        actions_np = np.array([t.action for t in transitions])
+        rewards_np = np.array([t.reward for t in transitions])
+        dones_np = np.array([t.done for t in transitions])
 
-        # CNN 특징 처리 (배치 정규화 포함)
-        cnn_feats_b = self.cnn(obs_b.reshape(-1, 1, 84, 84))
-        cnn_feats_b = self.cnn_bn(cnn_feats_b)
-        cnn_feats_b = cnn_feats_b.reshape(Config.batch_size, bi, -1)
+        actions = torch.tensor(actions_np, dtype=torch.float32, device=device)
+        rewards = torch.tensor(rewards_np, dtype=torch.float32, device=device).unsqueeze(1)
+        dones = torch.tensor(dones_np, dtype=torch.float32, device=device).unsqueeze(1)
 
-        # 상태 특징 처리 - 6차원으로 수정
-        state_feats_b = self.state_fc(st_b.reshape(-1, 6))
-        state_feats_b = self.state_bn(state_feats_b)
-        state_feats_b = F.relu(state_feats_b)
-        state_feats_b = state_feats_b.reshape(Config.batch_size, bi, -1)
+        # 2. 특징 추출 - 현재 상태
+        with torch.no_grad():  # 그래디언트 계산 방지로 메모리 사용 최적화
+            # 비주얼 특징 (CNN)
+            img_feat = self.cnn(depths)
+            img_feat = self.cnn_bn(img_feat)
 
-        # 특징 결합 및 GRU 처리
-        _, h0 = self.rnn(torch.cat([cnn_feats_b, state_feats_b], -1), h0)
+            # 상태 특징 (FC)
+            st_feat = F.relu(self.state_bn(self.state_fc(states)))
 
-        # learning pass - 배치 정규화 적용
-        # CNN 특징 처리
-        cnn_feats_l = self.cnn(obs_l.reshape(-1, 1, 84, 84))
-        cnn_feats_l = self.cnn_bn(cnn_feats_l)
-        cnn_feats_l = cnn_feats_l.reshape(Config.batch_size, Config.seq_length - bi, -1)
+            # 특징 결합
+            feat = torch.cat([img_feat, st_feat], dim=-1)
+            shared_feat = F.relu(self.shared_fc1(feat))
+            shared_feat = F.relu(self.shared_fc2(shared_feat))
 
-        # 상태 특징 처리 - 6차원으로 수정
-        state_feats_l = self.state_fc(st_l.reshape(-1, 6))
-        state_feats_l = self.state_bn(state_feats_l)
-        state_feats_l = F.relu(state_feats_l)
-        state_feats_l = state_feats_l.reshape(Config.batch_size, Config.seq_length - bi, -1)
+            # 다음 상태 특징 추출
+            img_feat_n = self.cnn(next_depths)
+            img_feat_n = self.cnn_bn(img_feat_n)
+            st_feat_n = F.relu(self.state_bn(self.state_fc(next_states)))
+            feat_n = torch.cat([img_feat_n, st_feat_n], dim=-1)
+            shared_n = F.relu(self.shared_fc1(feat_n))
+            shared_n = F.relu(self.shared_fc2(shared_n))
 
-        # 특징 결합 및 GRU 처리
-        out, _ = self.rnn(torch.cat([cnn_feats_l, state_feats_l], -1), h0)
+            # 다음 상태 액션 및 가치 계산
+            a_next, logp_n = self.actor.sample(shared_n)
+            q1n = self.target_q1(shared_n, a_next)
+            q2n = self.target_q2(shared_n, a_next)
 
-        # 마지막 출력 저장 (이후에 여러 번 복사하여 사용)
-        last = out[:, -1].clone()
+            # 차원 일치 보장
+            q1n = q1n.squeeze(-1)
+            q2n = q2n.squeeze(-1)
+            logp_n = logp_n.squeeze(-1)
 
-        # 액션, 보상, 완료 상태 준비 - 단일 보상 값 사용
-        actions = torch.stack([torch.tensor(s[-1].action, dtype=torch.float32) for s in seqs]).to(Config.device)
-        r = torch.tensor([float(s[-1].reward) for s in seqs], dtype=torch.float32, device=Config.device)
-        done = torch.tensor([float(s[-1].done) for s in seqs], dtype=torch.float32, device=Config.device)
+            # 엔트로피 보정된 Q 타겟 계산
+            alpha = self.log_alpha.exp().detach()
+            target_q = rewards + (1 - dones) * Config.gamma * (
+                        torch.min(q1n, q2n).unsqueeze(-1) - alpha * logp_n.unsqueeze(-1))
+            target_q = target_q.squeeze(-1)  # 일관된 차원 보장
 
-        # 1. 크리틱 업데이트
-        with torch.no_grad():
-            a_next, logp_next = self.actor.sample(last)
-            q1n = self.target_q1(last, a_next).squeeze(-1)
-            q2n = self.target_q2(last, a_next).squeeze(-1)
-            alpha = torch.clamp(self.log_alpha.exp(), min=1e-10, max=10.0)  # 안정성을 위한 클램핑
-            target = r + (1 - done) * Config.gamma * (torch.min(q1n, q2n) - alpha * logp_next.squeeze(-1))
+        # 3. Critic 업데이트 (Twin Q)
+        # 새 계산 그래프 시작
+        img_feat = self.cnn(depths)
+        img_feat = self.cnn_bn(img_feat)
+        st_feat = F.relu(self.state_bn(self.state_fc(states)))
+        feat = torch.cat([img_feat, st_feat], dim=-1)
+        shared_feat = F.relu(self.shared_fc1(feat))
+        shared_feat = F.relu(self.shared_fc2(shared_feat))
 
-        # 크리틱 손실 계산 및 업데이트
-        q1_cur = self.q1(last, actions).squeeze(-1)
-        q2_cur = self.q2(last, actions).squeeze(-1)
-        critic_loss = F.mse_loss(q1_cur, target) + F.mse_loss(q2_cur, target)
+        q1_cur = self.q1(shared_feat, actions).squeeze(-1)
+        q2_cur = self.q2(shared_feat, actions).squeeze(-1)
 
+        # MSE 손실 계산 (차원 일치 확인)
+        critic_loss = F.mse_loss(q1_cur, target_q) + F.mse_loss(q2_cur, target_q)
         self.opt_critic.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.q1.parameters()) + list(self.q2.parameters()) +
-            list(self.cnn.parameters()) + list(self.state_fc.parameters()) +
-            list(self.rnn.parameters()),
-            max_norm=1.0
-        )
         self.opt_critic.step()
 
-        # 2. 액터 업데이트 - 새로운 계산 그래프 사용
-        last_actor = last.detach().clone()  # 완전히 분리된 복사본
+        # 4. Actor 업데이트 (분리된 계산 그래프 사용)
+        with torch.no_grad():
+            shared_feat_detached = shared_feat.detach()  # 그래디언트 흐름 차단
 
-        action_pi, logp_pi = self.actor.sample(last_actor)
-        q1_pi = self.q1(last_actor, action_pi).squeeze(-1)
-        q2_pi = self.q2(last_actor, action_pi).squeeze(-1)
+        action_pi, logp_pi = self.actor.sample(shared_feat_detached)
+        q1_pi = self.q1(shared_feat_detached, action_pi).squeeze(-1)
+        q2_pi = self.q2(shared_feat_detached, action_pi).squeeze(-1)
         q_pi = torch.min(q1_pi, q2_pi)
+        logp_pi = logp_pi.squeeze(-1)
 
-        # 알파 값은 계산 그래프에서 분리
-        alpha_detached = self.log_alpha.exp().detach()
-
-        actor_loss = (alpha_detached * logp_pi.squeeze(-1) - q_pi).mean()
-
+        # Actor 손실: 기대 Q값 최대화 + 엔트로피 보너스
+        alpha_det = self.log_alpha.exp().detach()
+        actor_loss = (alpha_det * logp_pi - q_pi).mean()
         self.opt_actor.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.opt_actor.step()
 
-        # 3. 알파 업데이트 - 또 다른 독립적인 계산 그래프
-        logp_pi_detached = logp_pi.detach().squeeze(-1)  # 그래프에서 분리
+        # 5. 온도 파라미터(알파) 업데이트
+        with torch.no_grad():
+            logp_pi_detached = logp_pi.detach()
 
         alpha_loss = -(self.log_alpha * (logp_pi_detached + Config.target_entropy)).mean()
-
         self.opt_alpha.zero_grad()
         alpha_loss.backward()
         self.opt_alpha.step()
 
-        # 4. 타겟 네트워크 소프트 업데이트
+        # 6. 타겟 네트워크 소프트 업데이트
         for p, tp in zip(self.q1.parameters(), self.target_q1.parameters()):
             tp.data.copy_(tp.data * (1 - Config.tau) + p.data * Config.tau)
         for p, tp in zip(self.q2.parameters(), self.target_q2.parameters()):
             tp.data.copy_(tp.data * (1 - Config.tau) + p.data * Config.tau)
 
-        # TD 오류를 계산하여 PER 업데이트
-        with torch.no_grad():
-            td_errors = torch.abs(q1_cur - target).cpu().numpy().tolist()
-
-        buffer.update_priorities(idxs, td_errors)
+        # 7. 우선순위 업데이트
+        td_errors = (q1_cur - target_q).abs().detach().cpu().numpy().tolist()
+        buffer.update_priorities(indices, td_errors)
 
         return {
             'critic_loss': critic_loss.item(),
             'actor_loss': actor_loss.item(),
             'alpha': self.log_alpha.exp().item()
         }
+
+
 
 # 라이다 데이터를 깊이 이미지로 변환
 def lidar_to_depth_image(lidar_points, height=Config.depth_image_height,
@@ -488,14 +468,18 @@ class DroneEnv:
         self.client.confirmConnection()
         self.client.enableApiControl(True)
 
-        # 목표 위치 설정 (임의로 설정, 실제 환경에 맞게 수정 필요)
+        # 목표 위치 설정
         self.goal_position = np.array([50.0, 0.0, -10.0])
 
-        self.goal_distance = 0
-        self.prev_goal_distance = 0
+        # 거리 기록
+        self.goal_distance = 0.0
+        self.prev_goal_distance = 0.0
 
         # 에피소드 스텝 카운터
         self.steps = 0
+
+        # 최근 4프레임 깊이 이미지 저장
+        self.depth_queue = deque(maxlen=4)
 
     def reset(self):
         # 드론 초기화
@@ -504,74 +488,61 @@ class DroneEnv:
         self.client.armDisarm(True)
         self.client.takeoffAsync().join()
 
-        # 초기 위치로 이동 (홈 위치, 약간의 랜덤성 추가)
-        initial_x, initial_y, initial_z = [0, 0, 0]
+        # 홈 위치 이동
+        self.client.moveToPositionAsync(0, 0, 0, 5).join()
 
-        self.client.moveToPositionAsync(initial_x, initial_y, initial_z, 5).join()
-
-        # 새로운 목표 위치 (랜덤)
+        # 랜덤 목표 설정
         while True:
             self.goal_position = np.array([
                 random.uniform(-19.0, 19.0),
                 random.uniform(-19.0, 19.0),
                 random.uniform(-19.0, 19.0)
             ])
-
             self.goal_distance = np.linalg.norm(self.goal_position)
             self.prev_goal_distance = self.goal_distance
-            if self.goal_distance >= 15:
-                print(f"New goal position: {self.goal_position}")
+            if self.goal_distance >= 15.0:
                 break
 
-        # 스텝 카운터 초기화
+        print(f"Goal: {self.goal_position}")
+
+        # 스텝 초기화
         self.steps = 0
 
-        # 초기 상태 가져오기
-        depth_image, drone_state, position = self._get_state()
+        # 초기 깊이 이미지 가져와 큐에 채우기
+        depth, state, _, _, _ = self._get_state()
+        self.depth_queue.clear()
+        for _ in range(4):
+            self.depth_queue.append(depth)
 
-        return depth_image, drone_state
+        # 스택된 상태 반환
+        depth_stack = np.stack(self.depth_queue, axis=0)  # shape [4,H,W]
+        return depth_stack, state
 
     def step(self, action):
+        # 액션 적용 (vx, vy, vz)
+        # 다음 상태 및 깊이
+        depth, state, action_simple, dist, position = self._get_state()
 
-        # 상태 및 라이다 데이터 가져오기
-        depth_image, state, position = self._get_state()
+        vx, vy, vz = action_simple * 0.2 + 0.8 * action
 
-        dir = state[3:] / np.linalg.norm(state[3:])
-
-        blend_action = dir * Config.max_drone_speed
-
-        action = 0.2 * blend_action + action * 0.8
-
-        # 액션 적용 (vx, vy, vz 속도)
-        vx, vy, vz = action
-
-        # AirSim에서는 NED 좌표계 사용
         self.client.moveByVelocityAsync(
-            float(vx),
-            float(vy),
-            float(vz),  # AirSim에서 z는 아래 방향이 양수
-            1.0  # 1초 동안 속도 유지
+            float(vx), float(vy), float(vz), 1.0
         )
 
 
 
-        # 보상과 종료 여부 계산
-        reward, done, info = self._compute_reward(depth_image, state, position)
+        # 큐 업데이트
+        self.depth_queue.append(depth)
+        depth_stack = np.stack(self.depth_queue, axis=0)
 
-        state[3:] /= np.linalg.norm(state[3:])
-
-        # 스텝 카운터 증가
+        # 보상·종료 계산
+        reward, done, info = self._compute_reward(depth, state, dist, position)
         self.steps += 1
-
-        #self.visualize_3d_lidar(depth_image, show=True)
-
-        # 최대 스텝 수 초과 시 종료
         if self.steps >= Config.max_episode_steps:
-            print(f"timeout: {position}")
             done = True
             info['timeout'] = True
 
-        return depth_image, state, reward, done, info
+        return depth_stack, state, reward, done, info
 
     def visualize_3d_lidar(self, depth_image, frame_count=0, show=True, save_path=None):
         """
@@ -701,12 +672,15 @@ class DroneEnv:
         ])
 
         # NED 좌표계에서 목표까지의 상대 벡터
-        relative_goal_ned = self.goal_position - position
+        rel = self.goal_position - position
+        dist = np.linalg.norm(rel) + 1e-8
+        dir_to_goal = rel / dist
+        action_simple = dir_to_goal * Config.max_action
 
         # 바디 프레임 기준 상태 벡터: 속도(3), 목표 상대 위치(3), 드론 pose(3)
-        drone_state = np.concatenate([velocity_ned, relative_goal_ned])
+        drone_state = np.concatenate([velocity_ned, dir_to_goal])
 
-        return depth_image, drone_state, position
+        return depth_image, drone_state, action_simple, dist, position
 
     def _quaternion_to_rotation_matrix(self, w, x, y, z):
         # 쿼터니언을 회전 행렬로 변환
@@ -740,9 +714,9 @@ class DroneEnv:
 
         return np.array([w, x, y, z])
 
-    def _compute_reward(self, depth_image, drone_state, position):
+    def _compute_reward(self, depth_image, drone_state, dist, position):
         # 현재 위치와 목표 위치 거리
-        current_goal_distance = np.linalg.norm(drone_state[3:6])
+        current_goal_distance = dist
 
         # 충돌 정보
         collision_info = self.client.simGetCollisionInfo()
@@ -763,8 +737,7 @@ class DroneEnv:
             print(f"Reached: {position}")
         elif has_collided:
             reward = -50.0  # 충돌 페널티 (더 큰 부정값)
-            if self.steps > Config.seq_length:
-                done = True
+            done = True
             info = {"status": "collision", "distance_to_goal": current_goal_distance}
             print(f"Collided: {position}")
         else:
@@ -810,19 +783,6 @@ class DroneEnv:
         self.prev_goal_distance = current_goal_distance
 
         return reward, done, info
-
-
-# Transition 클래스 정의 - 분리된 보상 구조를 위해 수정
-class Transition:
-    def __init__(self, depth_image, state, action, reward, next_depth_image, next_state, done):
-        self.depth_image = depth_image
-        self.state = state
-        self.action = action
-        self.reward = reward  # 단일 보상 값
-        self.next_depth_image = next_depth_image
-        self.next_state = next_state
-        self.done = done
-
 
 # 학습 진행 상황을 추적하는 클래스
 class TrainingTracker:
@@ -906,184 +866,90 @@ class TrainingTracker:
 
 # 학습 함수
 def train_rsac():
-    # 환경, 에이전트, 리플레이 버퍼 초기화
+    # 환경, 에이전트, 버퍼 초기화
     env = DroneEnv()
     agent = RSACAgent().to(Config.device)
-
-    # 리플레이 버퍼 사용
-    buffer = PrioritizedSequenceReplayBuffer(capacity=10000, alpha=0.6, burn_in=Config.burn_in)
-
-    # 학습 진행 추적기
+    buffer = PrioritizedTransitionReplayBuffer(capacity=10000, alpha=0.6)
     tracker = TrainingTracker()
 
-    # 모델, 로그 디렉토리 생성
+    # 로그 디렉토리 설정
     os.makedirs(Config.model_dir, exist_ok=True)
     os.makedirs(Config.log_dir, exist_ok=True)
-    log_csv_path = os.path.join(Config.log_dir, "training_log.csv")
+    log_csv = os.path.join(Config.log_dir, 'training_log.csv')
+    with open(log_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Episode','Steps','Reward','AvgReward','Status','CriticLoss','ActorLoss','Alpha'])
 
-    # CSV 헤더 작성
-    with open(log_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-        csv_writer = csv.writer(csvfile)
-        csv_writer.writerow([
-            'Episode', 'Steps', 'Duration', 'Reward', 'Avg_Reward',
-            'Status', 'Success_Rate', 'Critic_Loss', 'Actor_Loss', 'Alpha'
-        ])
+    # 체크포인트 로드
+    latest = os.path.join(Config.model_dir, 'rsac_latest.pt')
+    start_ep = 0
+    if os.path.exists(latest):
+        cp = torch.load(latest, map_location=Config.device)
+        agent.load_state_dict(cp['model_state'])
+        start_ep = cp.get('episode',0) + 1
+        print(f"Resuming from episode {start_ep}")
 
+    # 에피소드 루프
+    for ep in range(start_ep, Config.max_episodes):
+        depth_stack, state = env.reset()
+        episode_reward = 0.0
+        done = False
+        steps = 0
+        critic_loss = actor_loss = alpha = 0.0
 
-    # 체크포인트 로드 (있을 경우)
-    latest_model_path = os.path.join(Config.model_dir, f"rsac_latest.pt")
-    start_episode = 0
-    if os.path.exists(latest_model_path):
-        try:
-            checkpoint = torch.load(latest_model_path, map_location=Config.device)
-            agent.load_state_dict(checkpoint['model_state'])
-            start_episode = checkpoint.get('episode', 0) + 1
-            print(f"체크포인트 로드 완료: 에피소드 {start_episode}부터 계속")
-        except Exception as e:
-            print(f"체크포인트 로드 실패: {e}")
+        t0 = time.time()
+        while not done and steps < Config.max_episode_steps:
+            # 액션 선택
+            d_tensor = torch.FloatTensor(depth_stack).unsqueeze(0).to(Config.device)  # (1,4,H,W)
+            s_tensor = torch.FloatTensor(state).unsqueeze(0).to(Config.device)        # (1,state_dim)
+            action = agent.select_action(d_tensor, s_tensor).cpu().numpy()[0]
 
-    # 에피소드 반복
-    for episode in range(start_episode, Config.max_episodes):
-        try:
-            # 환경 초기화
-            depth_image, drone_state = env.reset()
+            # 환경 스텝
+            next_depth, next_state, reward, done, info = env.step(action)
 
-            # 에피소드 상태 저장 변수
-            episode_reward = 0
-            episode_steps = 0
-            episode_transitions = []  # 현재 에피소드의 전이 저장
-            episode_critic_losses = []
-            episode_actor_losses = []
-            episode_alphas = []
+            # 버퍼 저장
+            buffer.push(depth_stack, state, action, reward, next_depth, next_state, done)
 
+            episode_reward += reward
+            steps += 1
+            depth_stack, state = next_depth, next_state
 
-            # 히든 스테이트 초기화
-            h = None
+            # 업데이트
+            if len(buffer) > Config.batch_size and steps % 10 == 0:
+                upd = agent.update(buffer)
+                critic_loss = upd.get('critic_loss', critic_loss)
+                actor_loss = upd.get('actor_loss', actor_loss)
+                alpha = upd.get('alpha', alpha)
 
-            done = False
-            episode_start_time = time.time()
+        # 에피소드 종료
+        duration = time.time() - t0
+        status = info.get('status', 'unknown')
+        tracker.add_episode_stats(episode_reward, steps, status)
+        avg_reward, _ = tracker.get_recent_stats()
 
-            # 에피소드 실행
-            while not done and episode_steps < Config.max_episode_steps:
-                # 에이전트로부터 액션 획득
-                with torch.no_grad():
-                    # 깊이 이미지 변환 및 상태 전처리
-                    depth_tensor = torch.FloatTensor(depth_image).unsqueeze(0).unsqueeze(0).to(Config.device)
-                    state_tensor = torch.FloatTensor(drone_state).unsqueeze(0).unsqueeze(0).to(Config.device)
+        # 로그 기록
+        with open(log_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([ep, steps, f"{episode_reward:.2f}", f"{avg_reward:.2f}", status,
+                             f"{critic_loss:.4f}", f"{actor_loss:.4f}", f"{alpha:.4f}"])
 
-                    # 시퀀스 형태로 변환
-                    if episode_steps == 0:
-                        # 처음 단계인 경우 이미지와 상태를 반복
-                        depth_seq = depth_tensor.repeat(1, Config.seq_length, 1, 1, 1)
-                        state_seq = state_tensor.repeat(1, Config.seq_length, 1)
-                    else:
-                        # 아닌 경우 이전 시퀀스에 현재 이미지와 상태 추가
-                        depth_seq = torch.cat([depth_seq[:, 1:], depth_tensor.unsqueeze(1)], dim=1)
-                        state_seq = torch.cat([state_seq[:, 1:], state_tensor], dim=1)
+        # 출력
+        if ep % Config.log_interval == 0:
+            print(f"Ep {ep} | Steps {steps} | Duration {duration} | Rwd {episode_reward:.2f} | AvgR {avg_reward:.2f} | {status}")
 
-                    # 액션 선택
-                    action_tensor, h = agent.select_action(depth_seq, state_seq, h)
-                    action = action_tensor.cpu().numpy()[0]
+        # 모델 저장
+        if ep % Config.save_interval == 0:
+            ckpt = {'model_state': agent.state_dict(), 'episode': ep}
+            torch.save(ckpt, latest)
+            torch.save(ckpt, os.path.join(Config.model_dir, f"rsac_ep{ep}.pt"))
 
-                # 환경에서 한 스텝 진행 - 단일 보상 값 반환
-                next_depth_image, next_state, reward, done, info = env.step(action)
+    # 최종 저장
+    final = os.path.join(Config.model_dir, 'rsac_final.pt')
+    torch.save({'model_state': agent.state_dict(), 'episode': Config.max_episodes-1}, final)
+    print("Training complete.")
 
-                # 전이 저장 - 단일 보상 값 사용
-                transition = Transition(
-                    depth_image, drone_state, action,
-                    float(reward),  # 단일 보상 값
-                    next_depth_image, next_state, done
-                )
-                episode_transitions.append(transition)
-
-                # 보상 누적
-                episode_reward += reward
-                episode_steps += 1
-
-                # 다음 상태로 업데이트
-                depth_image = next_depth_image
-                drone_state = next_state
-
-                # 에이전트 업데이트 (정기적으로)
-                if len(buffer) > Config.batch_size:
-                    if episode_steps % 10 == 0:  # 10스텝마다 업데이트
-                        update_info = agent.update(buffer)
-                        if update_info:
-                            episode_critic_losses.append(update_info['critic_loss'])
-                            episode_actor_losses.append(update_info['actor_loss'])
-                            episode_alphas.append(update_info['alpha'])
-
-            # 에피소드가 끝나면 전이를 리플레이 버퍼에 추가
-            if episode_transitions:
-                buffer.push(episode_transitions)
-
-            # 에피소드 통계 기록
-            avg_critic_loss = np.mean(episode_critic_losses) if episode_critic_losses else 0
-            avg_actor_loss = np.mean(episode_actor_losses) if episode_actor_losses else 0
-            avg_alpha = np.mean(episode_alphas) if episode_alphas else 0
-            episode_duration = time.time() - episode_start_time
-            status = info.get("status", "unknown")
-
-            tracker.add_episode_stats(episode_reward, episode_steps, status)
-            avg_reward, success_rate = tracker.get_recent_stats()
-
-            # 로그 출력
-            if episode % Config.log_interval == 0:
-                print(f"Episode {episode}: " +
-                      f"Time={episode_duration:.2f}s, Steps={episode_steps}, " +
-                      f"Reward={episode_reward:.2f}, Avg Reward={avg_reward:.2f}, Status={status}")
-
-                # 로그 파일에 기록 (CSV)
-                with open(log_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
-                    csv_writer = csv.writer(csvfile)
-                    csv_writer.writerow([
-                        episode, episode_steps, f"{episode_duration:.2f}",
-                        f"{episode_reward:.2f}", f"{avg_reward:.2f}",
-                        status, f"{success_rate:.4f}",
-                        f"{avg_critic_loss:.4f}", f"{avg_actor_loss:.4f}", f"{avg_alpha:.4f}"
-                    ])
-            print()
-
-            # 모델 저장
-            if episode % Config.save_interval == 0:
-                # 모델 저장
-                checkpoint = {
-                    'model_state': agent.state_dict(),
-                    'episode': episode
-                }
-                latest_filepath = os.path.join(Config.model_dir, f"rsac_latest.pt")
-                torch.save(checkpoint, latest_filepath)
-
-                # 특정 에피소드 체크포인트 저장
-                ep_filepath = os.path.join(Config.model_dir, f"rsac_ep{episode}.pt")
-                torch.save(checkpoint, ep_filepath)
-
-                print(f"모델 체크포인트 저장 완료: {ep_filepath}")
-
-                # 학습 진행 그래프 저장
-                graph_path = os.path.join(Config.log_dir, f"training_progress_ep{episode}.png")
-                tracker.plot_training_progress(save_path=graph_path)
-
-        except Exception as e:
-            print(f"에피소드 {episode} 실행 중 오류 발생: {e}")
-            import traceback
-            traceback.print_exc()
-            # 오류 발생해도 계속 진행
-
-    # 최종 모델 저장
-    checkpoint = {
-        'model_state': agent.state_dict(),
-        'episode': Config.max_episodes - 1
-    }
-    final_filepath = os.path.join(Config.model_dir, f"rsac_final.pt")
-    torch.save(checkpoint, final_filepath)
-
-    # 최종 학습 진행 그래프 저장
-    final_graph_path = os.path.join(Config.log_dir, "training_progress_final.png")
-    tracker.plot_training_progress(save_path=final_graph_path)
-
-    print("Training completed!")
     return agent, tracker
+
 
 
 # 메인 함수
