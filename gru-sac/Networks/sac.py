@@ -39,10 +39,8 @@ class SACConfig:
     start_steps = 1000  # Steps to take random actions for exploration
     update_interval = 1  # How often to update the networks
 
-    # Dual Experience Buffer
-    success_buffer_size = 300000
-    fail_buffer_size = 700000
-    sample_success_ratio = 0.4  # Ratio of samples from success buffer
+    # Experience Buffer
+    buffer_capacity = 1000  # Number of episodes to store (not transitions)
 
 
 # Convolutional Self-Attention Layer
@@ -337,165 +335,220 @@ class GRUCriticNetwork(nn.Module):
         return q1, gru_hidden
 
 
-# Sequence-based Experience Buffer
-class SequenceExperienceBuffer:
-    def __init__(self, success_buffer_size, fail_buffer_size, state_dim, action_dim, seq_length=SACConfig.seq_length):
-        self.success_buffer = deque(maxlen=success_buffer_size)
-        self.fail_buffer = deque(maxlen=fail_buffer_size)
+# 반환 타입 정의
+RecurrentBatch = namedtuple('RecurrentBatch',
+                            'depth_sequences states actions rewards next_depth_sequences next_states dones')
+
+
+class RecurrentReplayBuffer:
+    def __init__(self, o_dim, state_dim, action_dim, max_episode_len, segment_len=None,
+                 capacity=100000, batch_size=64):
+        """
+        순환 신경망을 위한 경험 재생 버퍼
+
+        Args:
+            o_dim: 관측(이미지) 차원 [H, W]
+            state_dim: 상태 벡터 차원
+            action_dim: 행동 벡터 차원
+            max_episode_len: 최대 에피소드 길이 (num_bptt로도 사용)
+            segment_len: 비겹침 잘린 bptt를 위한 세그먼트 길이 (None이면 전체 에피소드 사용)
+            capacity: 버퍼 용량 (저장할 에피소드 수)
+            batch_size: 샘플링할 배치 크기
+        """
+        # 데이터 저장소 (고정 크기 배열)
+        self.depth_images = np.zeros((capacity, max_episode_len + 1, o_dim[0], o_dim[1]))
+        self.states = np.zeros((capacity, max_episode_len + 1, state_dim))
+        self.actions = np.zeros((capacity, max_episode_len, action_dim))
+        self.rewards = np.zeros((capacity, max_episode_len, 1))
+        self.dones = np.zeros((capacity, max_episode_len, 1))
+        self.masks = np.zeros((capacity, max_episode_len, 1))
+        self.ep_lens = np.zeros((capacity,))
+        self.ready_for_sampling = np.zeros((capacity,))
+
+        # 포인터
+        self.episode_ptr = 0  # 에피소드 인덱스
+        self.time_ptr = 0  # 타임스텝 인덱스
+
+        # 상태 추적
+        self.starting_new_episode = True
+        self.num_episodes = 0
+
+        # 하이퍼 파라미터
+        self.capacity = capacity
+        self.o_dim = o_dim
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.seq_length = seq_length
+        self.batch_size = batch_size
+        self.max_episode_len = max_episode_len
 
-        # 현재 에피소드 임시 저장소
-        self.current_episode = []
+        # 세그먼트 길이 검증
+        if segment_len is not None:
+            assert max_episode_len % segment_len == 0, "세그먼트 길이는 max_episode_len의 약수여야 합니다"
+        self.segment_len = segment_len
 
-        # 시퀀스 데이터 구조 정의
-        self.experience = namedtuple("Experience",
-                                     field_names=["depth_sequence", "state_sequence",
-                                                  "action_sequence", "reward_sequence",
-                                                  "next_depth_sequence", "next_state_sequence",
-                                                  "done_sequence", "is_success"])
+        # 장치
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def add(self, depth_image, state, action, reward, next_depth_image, next_state, done, is_success):
+    def add(self, depth_image, state, action, reward, next_depth_image, next_state, done, cutoff=False):
         """
         환경에서 단일 스텝 데이터 추가
 
         Args:
-            depth_image: 현재 깊이 이미지 [H, W] 또는 시퀀스 [seq, H, W]
+            depth_image: 현재 깊이 이미지 [H, W]
             state: 현재 상태 벡터 [state_dim]
             action: 행동 벡터 [action_dim]
             reward: 보상 값 (스칼라)
-            next_depth_image: 다음 깊이 이미지 [H, W] 또는 시퀀스 [seq, H, W]
+            next_depth_image: 다음 깊이 이미지 [H, W]
             next_state: 다음 상태 벡터 [state_dim]
             done: 에피소드 종료 여부 (불리언)
-            is_success: 성공 여부 (불리언)
+            cutoff: 에피소드 강제 종료 여부 (불리언)
         """
-        # 시퀀스 입력을 처리하는 경우, 마지막 프레임만 사용
-        if len(depth_image.shape) > 2:  # 시퀀스 감지
-            depth_image = depth_image[-1]  # 마지막 프레임만 사용
+        # 새 에피소드 시작 시 현재 슬롯 초기화
+        if self.starting_new_episode:
+            self.depth_images[self.episode_ptr] = 0
+            self.states[self.episode_ptr] = 0
+            self.actions[self.episode_ptr] = 0
+            self.rewards[self.episode_ptr] = 0
+            self.dones[self.episode_ptr] = 0
+            self.masks[self.episode_ptr] = 0
+            self.ep_lens[self.episode_ptr] = 0
+            self.ready_for_sampling[self.episode_ptr] = 0
 
-        if len(next_depth_image.shape) > 2:  # 시퀀스 감지
-            next_depth_image = next_depth_image[-1]  # 마지막 프레임만 사용
+            self.starting_new_episode = False
 
-        # 현재 에피소드에 스텝 데이터 추가
-        self.current_episode.append(
-            (depth_image, state, action, reward, next_depth_image, next_state, done, is_success))
+        # 데이터 저장
+        self.depth_images[self.episode_ptr, self.time_ptr] = depth_image
+        self.states[self.episode_ptr, self.time_ptr] = state
+        self.actions[self.episode_ptr, self.time_ptr] = action
+        self.rewards[self.episode_ptr, self.time_ptr] = reward
+        self.dones[self.episode_ptr, self.time_ptr] = done
+        self.masks[self.episode_ptr, self.time_ptr] = 1
+        self.ep_lens[self.episode_ptr] += 1
 
-        # 에피소드가 종료되면 시퀀스 생성 및 버퍼에 추가
-        if done:
-            self._process_episode(is_success)
-            self.current_episode = []  # 에피소드 초기화
+        if done or cutoff:
+            # 다음 관측 저장
+            self.depth_images[self.episode_ptr, self.time_ptr + 1] = next_depth_image
+            self.states[self.episode_ptr, self.time_ptr + 1] = next_state
+            self.ready_for_sampling[self.episode_ptr] = 1
 
-    def _process_episode(self, final_is_success):
-        """에피소드 완료 시 시퀀스로 분할하여 버퍼에 추가"""
-        if len(self.current_episode) < self.seq_length:
-            return  # 너무 짧은 에피소드는 무시
+            # 포인터 재설정
+            self.episode_ptr = (self.episode_ptr + 1) % self.capacity
+            self.time_ptr = 0
 
-        # 에피소드를 시퀀스로 분할 (sliding window 방식)
-        for i in range(0, len(self.current_episode) - self.seq_length + 1):
-            seq_slice = self.current_episode[i:i + self.seq_length]
+            # 추적 변수 업데이트
+            self.starting_new_episode = True
+            if self.num_episodes < self.capacity:
+                self.num_episodes += 1
+        else:
+            # 포인터 증가
+            self.time_ptr += 1
 
-            # 시퀀스 데이터 추출
-            depth_sequence = np.array([step[0] for step in seq_slice])  # [seq_len, H, W]
-            state_sequence = np.array([step[1] for step in seq_slice])
-            action_sequence = np.array([step[2] for step in seq_slice])
-            reward_sequence = np.array([step[3] for step in seq_slice])
-            next_depth_sequence = np.array([step[4] for step in seq_slice])
-            next_state_sequence = np.array([step[5] for step in seq_slice])
-            done_sequence = np.array([step[6] for step in seq_slice])
-
-            # 마지막 스텝만 done=True로 설정
-            seq_is_done = done_sequence[-1]
-
-            # 에피소드의 최종 결과에 따라 성공/실패 결정
-            is_success_seq = final_is_success
-
-            # 경험 객체 생성 및 버퍼에 추가
-            e = self.experience(
-                depth_sequence, state_sequence, action_sequence,
-                reward_sequence, next_depth_sequence, next_state_sequence,
-                np.array([False] * (self.seq_length - 1) + [seq_is_done]), is_success_seq
-            )
-
-            if is_success_seq:
-                self.success_buffer.append(e)
-            else:
-                self.fail_buffer.append(e)
-
-    def sample(self, batch_size, success_ratio=0.4):
+    def sample(self, batch_size=None, success_ratio=None):
         """
-        버퍼에서 시퀀스 데이터 샘플링
-
-        Args:
-            batch_size: 샘플링할 배치 크기
-            success_ratio: 성공 버퍼에서 샘플링할 비율
+        버퍼에서 에피소드 배치 샘플링
 
         Returns:
-            각 필드의 텐서 배치
+            RecurrentBatch 객체 (각 필드는 텐서)
         """
-        # 성공/실패 버퍼에서 샘플 수 계산
-        success_samples = int(batch_size * success_ratio)
-        fail_samples = batch_size - success_samples
+        if batch_size is None:
+            batch_size = self.batch_size
 
-        # 버퍼 크기에 따라 샘플 수 조정
-        if len(self.success_buffer) < success_samples:
-            success_samples = len(self.success_buffer)
-            fail_samples = batch_size - success_samples
+        assert self.num_episodes >= batch_size, "샘플링할 충분한 에피소드가 없습니다"
 
-        if len(self.fail_buffer) < fail_samples:
-            fail_samples = len(self.fail_buffer)
-            success_samples = batch_size - fail_samples
+        # 샘플링 가능한 에피소드 인덱스
+        options = np.where(self.ready_for_sampling == 1)[0]
 
-        # 버퍼에서 샘플링
-        success_experiences = random.sample(self.success_buffer, min(success_samples, len(self.success_buffer))) if len(
-            self.success_buffer) > 0 else []
-        fail_experiences = random.sample(self.fail_buffer, min(fail_samples, len(self.fail_buffer))) if len(
-            self.fail_buffer) > 0 else []
+        # 에피소드 길이에 비례하여 샘플링 가중치 설정
+        ep_lens_of_options = self.ep_lens[options]
+        probas_of_options = ep_lens_of_options / np.sum(ep_lens_of_options)
 
-        # 성공/실패 샘플 결합 및 셔플
-        experiences = success_experiences + fail_experiences
-        random.shuffle(experiences)
+        # 에피소드 샘플링
+        choices = np.random.choice(options, p=probas_of_options, size=batch_size)
+        ep_lens_of_choices = self.ep_lens[choices]
 
-        # 샘플이 없는 경우 처리
-        if len(experiences) == 0:
-            return None, None, None, None, None, None, None
+        if self.segment_len is None:
+            # 전체 에피소드 사용 (배치 내 최대 길이로 패딩)
+            max_ep_len_in_batch = int(np.max(ep_lens_of_choices))
 
-        # 텐서 변환 (배치 및 시퀀스 차원 유지)
-        depth_sequences = torch.from_numpy(np.array([e.depth_sequence for e in experiences if e is not None])).float()
-        state_sequences = torch.from_numpy(np.array([e.state_sequence for e in experiences if e is not None])).float()
-        action_sequences = torch.from_numpy(np.array([e.action_sequence for e in experiences if e is not None])).float()
-        reward_sequences = torch.from_numpy(np.array([e.reward_sequence for e in experiences if e is not None])).float()
-        next_depth_sequences = torch.from_numpy(
-            np.array([e.next_depth_sequence for e in experiences if e is not None])).float()
-        next_state_sequences = torch.from_numpy(
-            np.array([e.next_state_sequence for e in experiences if e is not None])).float()
-        done_sequences = torch.from_numpy(
-            np.array([e.done_sequence for e in experiences if e is not None]).astype(np.uint8)).float()
+            # 해당 numpy 배열 추출
+            o = self.depth_images[choices][:, :max_ep_len_in_batch + 1]
+            s = self.states[choices][:, :max_ep_len_in_batch + 1]
+            a = self.actions[choices][:, :max_ep_len_in_batch]
+            r = self.rewards[choices][:, :max_ep_len_in_batch]
+            d = self.dones[choices][:, :max_ep_len_in_batch]
+            m = self.masks[choices][:, :max_ep_len_in_batch]
 
-        # 각 시퀀스의 마지막 요소만 반환 (현재 상태와 다음 상태)
-        states = state_sequences[:, -1]
-        actions = action_sequences[:, -1]
-        rewards = reward_sequences[:, -1].unsqueeze(1)
-        next_states = next_state_sequences[:, -1]
-        dones = done_sequences[:, -1].unsqueeze(1)
+            # 텐서로 변환
+            o = torch.FloatTensor(o).to(self.device)
+            s = torch.FloatTensor(s).to(self.device)
+            a = torch.FloatTensor(a).to(self.device)
+            r = torch.FloatTensor(r).to(self.device)
+            d = torch.FloatTensor(d).to(self.device)
+            m = torch.FloatTensor(m).to(self.device)
 
-        return depth_sequences, states, actions, rewards, next_depth_sequences, next_states, dones
+            # 현재 상태와 다음 상태 분리
+            s_current = s[:, :-1]
+            s_next = s[:, 1:]
+            o_current = o[:, :-1]
+            o_next = o[:, 1:]
+
+            return RecurrentBatch(o_current, s_current, a, r, o_next, s_next, d)
+
+        else:
+            # 세그먼트 사용 (truncated BPTT)
+            num_segments_for_each_item = np.ceil(ep_lens_of_choices / self.segment_len).astype(int)
+
+            o = self.depth_images[choices]
+            s = self.states[choices]
+            a = self.actions[choices]
+            r = self.rewards[choices]
+            d = self.dones[choices]
+            m = self.masks[choices]
+
+            # 세그먼트 초기화
+            o_seg = np.zeros((batch_size, self.segment_len + 1, *self.o_dim))
+            s_seg = np.zeros((batch_size, self.segment_len + 1, self.state_dim))
+            a_seg = np.zeros((batch_size, self.segment_len, self.action_dim))
+            r_seg = np.zeros((batch_size, self.segment_len, 1))
+            d_seg = np.zeros((batch_size, self.segment_len, 1))
+            m_seg = np.zeros((batch_size, self.segment_len, 1))
+
+            # 각 항목에 대해 무작위 세그먼트 선택
+            for i in range(batch_size):
+                start_idx = np.random.randint(num_segments_for_each_item[i]) * self.segment_len
+                o_seg[i] = o[i][start_idx:start_idx + self.segment_len + 1]
+                s_seg[i] = s[i][start_idx:start_idx + self.segment_len + 1]
+                a_seg[i] = a[i][start_idx:start_idx + self.segment_len]
+                r_seg[i] = r[i][start_idx:start_idx + self.segment_len]
+                d_seg[i] = d[i][start_idx:start_idx + self.segment_len]
+                m_seg[i] = m[i][start_idx:start_idx + self.segment_len]
+
+            # 텐서로 변환
+            o_seg = torch.FloatTensor(o_seg).to(self.device)
+            s_seg = torch.FloatTensor(s_seg).to(self.device)
+            a_seg = torch.FloatTensor(a_seg).to(self.device)
+            r_seg = torch.FloatTensor(r_seg).to(self.device)
+            d_seg = torch.FloatTensor(d_seg).to(self.device)
+            m_seg = torch.FloatTensor(m_seg).to(self.device)
+
+            # 현재 상태와 다음 상태 분리
+            s_current = s_seg[:, :-1]
+            s_next = s_seg[:, 1:]
+            o_current = o_seg[:, :-1]
+            o_next = o_seg[:, 1:]
+
+            return RecurrentBatch(o_current, s_current, a_seg, r_seg, o_next, s_next, d_seg)
 
     def __len__(self):
-        return len(self.success_buffer) + len(self.fail_buffer)
-
-    def success_buffer_len(self):
-        return len(self.success_buffer)
-
-    def fail_buffer_len(self):
-        return len(self.fail_buffer)
+        return self.num_episodes
 
 
 # GRU-based SAC Agent
 class GRUSACAgent:
-    def __init__(self, state_dim, action_dim, max_action=1.0, device="cpu"):
+    def __init__(self, state_dim, action_dim, o_dim, max_action=1.0, device="cpu"):
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.o_dim = o_dim
         self.max_action = max_action
         self.device = device
 
@@ -520,13 +573,15 @@ class GRUSACAgent:
         # Target entropy
         self.target_entropy = SACConfig.target_entropy
 
-        # Experience buffer - 시퀀스 버퍼로 변경
-        self.memory = SequenceExperienceBuffer(
-            SACConfig.success_buffer_size,
-            SACConfig.fail_buffer_size,
-            state_dim,
-            action_dim,
-            SACConfig.seq_length
+        # Experience buffer - RecurrentReplayBuffer로 변경
+        self.memory = RecurrentReplayBuffer(
+            o_dim=o_dim,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            max_episode_len=SACConfig.max_episode_steps,
+            segment_len=None,  # 전체 에피소드 사용
+            capacity=SACConfig.buffer_capacity,
+            batch_size=SACConfig.batch_size
         )
 
         # GRU hidden states
@@ -614,23 +669,16 @@ class GRUSACAgent:
             return None
 
         # 재생 버퍼에서 샘플링
-        sampled_data = self.memory.sample(SACConfig.batch_size, SACConfig.sample_success_ratio)
-
-        # 데이터가 없는 경우 처리
-        if sampled_data[0] is None:
-            return None
+        batch = self.memory.sample(SACConfig.batch_size)
 
         # 샘플 데이터 언패킹
-        depth_sequences, states, actions, rewards, next_depth_sequences, next_states, dones = sampled_data
-
-        # 텐서를 디바이스로 이동
-        depth_sequences = depth_sequences.to(self.device)
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
-        next_depth_sequences = next_depth_sequences.to(self.device)
-        next_states = next_states.to(self.device)
-        dones = dones.to(self.device)
+        depth_sequences = batch.depth_sequences
+        states = batch.states
+        actions = batch.actions
+        rewards = batch.rewards
+        next_depth_sequences = batch.next_depth_sequences
+        next_states = batch.next_states
+        dones = batch.dones
 
         # 현재 온도 파라미터
         alpha = self.log_alpha.exp()

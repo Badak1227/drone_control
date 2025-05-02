@@ -17,33 +17,28 @@ import queue
 import time
 
 
-# GRUSACAgent 클래스에 비동기 학습 기능 추가
+# AsyncGRUSACAgent 클래스 수정
 class AsyncGRUSACAgent(GRUSACAgent):
     def __init__(self, state_dim, action_dim, max_action=1.0, device="cpu"):
         super().__init__(state_dim, action_dim, max_action, device)
 
         # 비동기 학습을 위한 추가 속성
-        self.experience_queue = queue.Queue(maxsize=10000)  # 경험 데이터 큐
-        self.stop_training = threading.Event()  # 학습 중단 이벤트
-        self.training_thread = None  # 학습 스레드
-        self.training_active = False  # 학습 활성화 상태
+        self.experience_queue = queue.Queue(maxsize=10000)
+        self.stop_training = threading.Event()
+        self.training_thread = None
+        self.training_active = False
 
         # 학습 설정
-        self.updates_per_iteration = 10  # 한 번의 반복당 업데이트 횟수
-        self.min_experiences_for_update = SACConfig.batch_size * 2  # 업데이트 시작을 위한 최소 경험 수
+        self.updates_per_iteration = 10
+        self.min_experiences_for_update = SACConfig.batch_size * 2
 
-    def add_experience(self, depth_image, state, action, reward, next_depth_image, next_state, done, is_success):
-        """경험 큐에 새로운 경험 추가"""
-        experience = (depth_image, state, action, reward, next_depth_image, next_state, done, is_success)
-        self.experience_queue.put(experience)
+    # 기존 add_experience 메서드 수정 불필요 (계속 is_success 사용)
 
     def _training_loop(self):
-        """학습 스레드의 메인 루프"""
         print("학습 스레드 시작됨")
 
-        # 일정 시간마다 업데이트 수행
         last_update_time = time.time()
-        update_interval = 0.1  # 100ms마다 업데이트 확인
+        update_interval = 0.1
 
         while not self.stop_training.is_set():
             current_time = time.time()
@@ -52,6 +47,7 @@ class AsyncGRUSACAgent(GRUSACAgent):
             experiences_count = 0
             while not self.experience_queue.empty():
                 experience = self.experience_queue.get()
+                # SequenceExperienceBuffer는 is_success 인자를 사용하므로 그대로 유지
                 self.memory.add(*experience)
                 experiences_count += 1
 
@@ -66,12 +62,13 @@ class AsyncGRUSACAgent(GRUSACAgent):
                     if update_result is not None:
                         update_info = update_result
 
-                # 업데이트 정보 로깅 (필요시)
+                # 업데이트 정보 로깅
                 if update_info:
                     critic_loss = update_info['critic_loss']
                     actor_loss = update_info['actor_loss']
                     print(f"Updates: critic_loss={critic_loss:.4f}, actor_loss={actor_loss:.4f}, " +
-                          f"buffer_size={len(self.memory)}")
+                          f"buffer_size={len(self.memory)}, " +
+                          f"Success={self.memory.success_buffer_len()}, Fail={self.memory.fail_buffer_len()}")
 
                 last_update_time = current_time
 
@@ -79,33 +76,6 @@ class AsyncGRUSACAgent(GRUSACAgent):
             time.sleep(0.001)
 
         print("학습 스레드 종료됨")
-
-    def start_training(self):
-        """비동기 학습 시작"""
-        if self.training_active:
-            print("이미 학습이 진행 중입니다.")
-            return
-
-        self.stop_training.clear()
-        self.training_thread = threading.Thread(target=self._training_loop)
-        self.training_thread.daemon = True  # 메인 스레드 종료 시 함께 종료
-        self.training_thread.start()
-        self.training_active = True
-        print("비동기 학습 시작됨")
-
-    def stop_training_thread(self):
-        """비동기 학습 중지"""
-        if not self.training_active:
-            print("학습이 진행 중이지 않습니다.")
-            return
-
-        self.stop_training.set()
-        if self.training_thread:
-            self.training_thread.join(timeout=2.0)  # 최대 2초 대기
-            self.training_thread = None
-
-        self.training_active = False
-        print("비동기 학습 중지됨")
 
 def train_agent_async(env, agent, num_episodes, max_steps=SACConfig.max_episode_steps,
                       render=False, start_steps=SACConfig.start_steps, log_dir="logs"):
