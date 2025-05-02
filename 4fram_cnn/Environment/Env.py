@@ -77,6 +77,9 @@ class DroneEnv:
         # 에피소드 스텝 카운터
         self.steps = 0
 
+        self.frame_history = []
+        self.history_length = 4
+
     def reset(self):
         # 드론 초기화
         self.client.reset()
@@ -109,7 +112,11 @@ class DroneEnv:
         # 초기 상태 가져오기
         depth_image, drone_state, position = self._get_state()
 
-        return depth_image, drone_state
+        self.frame_history = [depth_image.copy() for _ in range(self.history_length)]
+
+        stacked_frames = np.stack(self.frame_history, axis=0)
+
+        return stacked_frames, drone_state
 
     def step(self, action):
 
@@ -149,7 +156,14 @@ class DroneEnv:
             done = True
             info['timeout'] = True
 
-        return depth_image, state, reward, done, info
+        # 프레임 히스토리 업데이트
+        self.frame_history.pop(0)  # 가장 오래된 프레임 제거
+        self.frame_history.append(depth_image.copy())  # 새 프레임 추가
+
+        # 스택된 프레임 생성
+        stacked_frames = np.stack(self.frame_history, axis=0)
+
+        return stacked_frames, state, reward, done, info
 
     def _compute_reward(self, depth_image, drone_state, position):
         # 현재 위치와 목표 위치 거리

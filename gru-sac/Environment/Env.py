@@ -1,5 +1,6 @@
 import math
 import random
+from collections import deque
 
 import airsim
 import numpy as np
@@ -7,12 +8,13 @@ import torch
 import matplotlib.pyplot as plt
 
 class Config:
-    depth_image_height = 84
-    depth_image_width = 84
+    depth_image_height = 42
+    depth_image_width = 42
     max_lidar_distance = 20
     max_drone_speed = 5
     goal_threshold = 3
     max_episode_steps = 1000
+    seq_length = 8  # 시퀀스 길이 설정 (GRU 처리용)
 
 # 라이다 데이터를 깊이 이미지로 변환
 def lidar_to_depth_image(lidar_points, height=Config.depth_image_height,
@@ -77,6 +79,10 @@ class DroneEnv:
         # 에피소드 스텝 카운터
         self.steps = 0
 
+        # 프레임 히스토리 관리를 위한 변수 추가
+        self.frame_history = deque(maxlen=Config.seq_length)  # GRU에 맞게 시퀀스 길이 조정
+        self.history_length = Config.seq_length
+
     def reset(self):
         # 드론 초기화
         self.client.reset()
@@ -109,7 +115,15 @@ class DroneEnv:
         # 초기 상태 가져오기
         depth_image, drone_state, position = self._get_state()
 
-        return depth_image, drone_state
+        # 프레임 히스토리 초기화 (첫 번째 프레임으로 채우기)
+        self.frame_history.clear()
+        for _ in range(self.history_length):
+            self.frame_history.append(depth_image.copy())
+
+        # 스택된 프레임 반환
+        stacked_frames = np.stack(list(self.frame_history), axis=0)
+
+        return stacked_frames, drone_state
 
     def step(self, action):
 
@@ -141,15 +155,19 @@ class DroneEnv:
         # 스텝 카운터 증가
         self.steps += 1
 
-        # self.visualize_3d_lidar(depth_image, show=True)
-
         # 최대 스텝 수 초과 시 종료
         if self.steps >= Config.max_episode_steps:
             print(f"timeout: {position}")
             done = True
             info['timeout'] = True
 
-        return depth_image, state, reward, done, info
+        # 프레임 히스토리 업데이트
+        self.frame_history.append(depth_image.copy())
+
+        # 스택된 프레임 생성
+        stacked_frames = np.stack(list(self.frame_history), axis=0)
+
+        return stacked_frames, state, reward, done, info
 
     def _compute_reward(self, depth_image, drone_state, position):
         # 현재 위치와 목표 위치 거리

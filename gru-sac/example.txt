@@ -1,0 +1,27 @@
+# Example 1: Basic Training
+# Train the agent from scratch for 5000 episodes
+python train.py --mode train --episodes 5000 --log_dir logs
+
+# Example 2: Continue Training from Previous Model
+# Continue training from a saved model for another 2000 episodes
+python train.py --mode train --episodes 2000 --continue_train --model_path logs/sac_model_episode_3000.pt --log_dir logs
+
+# Example 3: Training with GPU Acceleration
+# Train the agent with GPU if available
+python train.py --mode train --episodes 5000 --gpu --log_dir logs
+
+# Example 4: Basic Testing
+# Test a trained agent for 100 episodes with visualization
+python train.py --mode test --episodes 100 --model_path logs/sac_model_final.pt --render
+
+# Example 5: Testing with Exploration Noise
+# Test the agent with some exploration noise (less deterministic)
+python train.py --mode test --episodes 100 --model_path logs/sac_model_final.pt --noise 0.1 --render
+
+# Example 6: Short Training for Debugging
+# Quick training run with few episodes and visualization for debugging
+python train.py --mode train --episodes 10 --render --log_dir debug_logs
+
+# Example 7: Testing with Different Max Steps
+# Limit the maximum steps per episode during testing
+python train.py --mode test --episodes 50 --model_path logs/sac_model_final.pt --max_steps 500 --render
