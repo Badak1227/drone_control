@@ -181,39 +181,19 @@ class DroneEnv:
             # 지속적인 보상 계산 (비터미널 상태)
 
             # 1. 목표 접근 보상: 이전 거리와 현재 거리의 차이 (진전 보상)
-            progress_reward = (self.prev_goal_distance - current_goal_distance) * 10.0
-
-            # 3. 장애물 회피 보상: 안전 거리에 따른 보상/페널티
-            danger_zone = 2.0
-            caution_zone = 5.0
-
-            if min_depth < danger_zone:
-                # 매우 위험한 상황 (강한 페널티)
-                obstacle_reward = -2.0 * ((danger_zone - min_depth) / danger_zone)
-            elif min_depth < caution_zone:
-                # 주의 구역 (약한 페널티)
-                obstacle_reward = -0.5 * ((caution_zone - min_depth) / (caution_zone - danger_zone))
-            else:
-                # 안전 구역 (작은 보상)
-                obstacle_reward = 0.1
-
-            # 4. 에너지 효율성 보상: 최적 속도 유지 장려
-            speed = np.linalg.norm(drone_state[:3])
-            optimal_speed = Config.max_drone_speed * 0.7  # 최대 속도의 70%를 최적으로 가정
-            efficiency_reward = -0.1 * abs(speed - optimal_speed) / optimal_speed
+            progress_reward = (self.prev_goal_distance - current_goal_distance) * 2
 
             # 5. 시간 패널티: 시간이 지날수록 작은 패널티
             time_penalty = -0.001 * self.steps
 
             # 모든 보상 요소 결합
-            reward = progress_reward + obstacle_reward + efficiency_reward + time_penalty
+            reward = progress_reward + time_penalty
 
             info = {
                 "status": "moving",
                 "distance_to_goal": current_goal_distance,
                 "obstacle_distance": min_depth,
                 "progress_reward": progress_reward,
-                "obstacle_reward": obstacle_reward
             }
 
         # 이전 거리 업데이트

@@ -1,279 +1,315 @@
+import torch
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.spatial.transform import Rotation as R
+import argparse
+import os
+import time
+from datetime import datetime
+
+# Import environment
+from Environment.Env import DroneEnv, Config
+
+# Import the GRU-SAC agent
+from Networks.sac import GRUSACAgent, SACConfig
 
 
-class SpeedEstimator:
-    """UWB range 변화를 이용한 속도 추정기 (논문 Section III-B)"""
+def train_agent(env, agent, num_episodes, max_steps=SACConfig.max_episode_steps,
+                render=False, start_steps=SACConfig.start_steps,
+                updates_per_episode=10, log_dir="logs"):
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    with open(log_file, "w") as f:
+        f.write("Episode,Reward,Steps,Status,SuccessRate,CollisionRate,AvgSteps,Losses\n")
 
-    def __init__(self, delta_t=0.1):
-        self.delta_t = delta_t
-        self.range_history = []
-        self.time_history = []
-        self.speed_history = []
+    episode_rewards = []
+    success_window = []
+    collision_window = []
+    step_counts = []
 
-    def update(self, range_measurement, time):
-        self.range_history.append(range_measurement)
-        self.time_history.append(time)
+    # 학습 진행 추적
+    total_steps = 0
+    best_success_rate = 0.0
 
-        # 최소 3개의 측정값이 필요
-        if len(self.range_history) < 3:
-            return 0.0
+    for episode in range(num_episodes):
+        ep_reward = 0.0
+        steps = 0
+        depth, state = env.reset()
+        agent.reset_hidden()
 
-        # 최근 3개 값만 사용
-        r0 = self.range_history[-3]
-        r1 = self.range_history[-2]
-        r2 = self.range_history[-1]
+        done = False
+        episode_losses = []
 
-        t0 = self.time_history[-3]
-        t2 = self.time_history[-1]
+        while not done and steps < max_steps:
+            if total_steps < start_steps:
+                # 초기 exploration을 위한 랜덤 액션
+                action = np.random.uniform(-agent.max_action, agent.max_action, size=agent.action_dim)
+            else:
+                # 정책에서 액션 선택
+                action = agent.select_action(depth, state)
 
-        # 실제 시간 간격 계산
-        actual_dt = (t2 - t0) / 2
+            next_depth, next_state, reward, done, info = env.step(action)
 
-        # 식 (6): 속도 계산
-        numerator = r2 ** 2 + r0 ** 2 - 2 * r1 ** 2
-        denominator = 2 * actual_dt ** 2
+            # Reward scaling 적용
+            scaled_reward = reward * SACConfig.reward_scale
 
-        if denominator <= 0 or numerator < 0:
-            return 0.0
+            agent.add_experience(depth, state, action, scaled_reward,
+                                 next_depth, next_state, float(done), False)
 
-        speed = np.sqrt(numerator / denominator)
-        self.speed_history.append(speed)
+            depth, state = next_depth, next_state
+            ep_reward += reward  # 원본 보상으로 기록
+            steps += 1
+            total_steps += 1
 
-        return speed
+            # 온라인 학습 수행
+            if total_steps > start_steps and total_steps % SACConfig.online_update_freq == 0:
+                for _ in range(SACConfig.batch_updates_per_step):
+                    update_info = agent.update_parameters(delayed_update=False)
+                    if update_info is not None:
+                        episode_losses.append({
+                            'critic': update_info['critic_loss'],
+                            'actor': update_info['actor_loss'],
+                            'alpha': update_info['alpha']
+                        })
 
+            if render:
+                env.visualize_3d_lidar(depth, frame_count=total_steps, show=True)
 
-class ExtendedKalmanFilter:
-    """단일 UWB 앵커를 위한 Extended Kalman Filter (논문 식(1), (2))"""
+        # 에피소드 종료 후 추가 배치 업데이트
+        last_info = info.get('status', '')
+        if total_steps > start_steps:
+            for _ in range(updates_per_episode):
+                update_info = agent.update_parameters(delayed_update=False)
+                if update_info is not None:
+                    episode_losses.append({
+                        'critic': update_info['critic_loss'],
+                        'actor': update_info['actor_loss'],
+                        'alpha': update_info['alpha']
+                    })
 
-    def __init__(self, initial_state, initial_covariance, anchor_position=[0, 0]):
-        self.state = initial_state  # [x, y, theta, v, w]
-        self.covariance = initial_covariance
-        self.anchor_position = anchor_position
-        self.dt = 0.1
+        # 통계 업데이트
+        episode_rewards.append(ep_reward)
+        step_counts.append(steps)
+        succ = 1 if last_info == 'goal_reached' else 0
+        coll = 1 if last_info == 'collision' else 0
+        success_window.append(succ)
+        collision_window.append(coll)
 
-        # 프로세스 노이즈
-        self.Q = np.eye(5) * 0.01
+        # 최근 100 에피소드 통계
+        if len(success_window) > 100:
+            success_window.pop(0)
+            collision_window.pop(0)
 
-        # 측정 노이즈
-        self.R = np.eye(3)
-        self.R[0, 0] = 0.2  # UWB range noise
-        self.R[1, 1] = 0.1  # heading noise
-        self.R[2, 2] = 0.5  # velocity noise
+        success_rate = sum(success_window) / len(success_window)
+        collision_rate = sum(collision_window) / len(collision_window)
+        recent_steps = step_counts[-min(100, len(step_counts)):]
+        avg_steps = sum(recent_steps) / len(recent_steps)
 
-    def predict(self, dt=None):
-        if dt is None:
-            dt = self.dt
+        # Loss 평균 계산
+        if episode_losses:
+            avg_critic_loss = sum(l['critic'] for l in episode_losses) / len(episode_losses)
+            avg_actor_loss = sum(l['actor'] for l in episode_losses) / len(episode_losses)
+            avg_alpha = sum(l['alpha'] for l in episode_losses) / len(episode_losses)
+        else:
+            avg_critic_loss = avg_actor_loss = avg_alpha = 0.0
 
-        x, y, theta, v, w = self.state
+        # 진행 상황 출력
+        print(f"Ep {episode:4d}: R={ep_reward:8.2f}, Steps={steps:4d}, "
+              f"Status={last_info:12s}, SuccRate={success_rate:.2f}, "
+              f"CollRate={collision_rate:.2f}, Buffer={len(agent.memory):6d}")
 
-        # 상태 전이 모델 (식 1)
-        F = np.eye(5)
-        F[0, 2] = -v * np.sin(theta) * dt
-        F[0, 3] = np.cos(theta) * dt
-        F[1, 2] = v * np.cos(theta) * dt
-        F[1, 3] = np.sin(theta) * dt
-        F[2, 4] = dt
+        if total_steps > start_steps:
+            print(f"         Losses - Critic: {avg_critic_loss:.4f}, "
+                  f"Actor: {avg_actor_loss:.4f}, Alpha: {avg_alpha:.4f}")
 
-        # 상태 예측
-        new_state = np.zeros(5)
-        new_state[0] = x + v * np.cos(theta) * dt
-        new_state[1] = y + v * np.sin(theta) * dt
-        new_state[2] = theta + w * dt
-        new_state[3] = v
-        new_state[4] = w
+        # 로그 파일에 기록
+        with open(log_file, "a") as f:
+            f.write(f"{episode},{ep_reward:.2f},{steps},{last_info},"
+                    f"{success_rate:.4f},{collision_rate:.4f},{avg_steps:.2f},"
+                    f"{avg_critic_loss:.4f},{avg_actor_loss:.4f},{avg_alpha:.4f}\n")
 
-        # 공분산 예측
-        new_covariance = F @ self.covariance @ F.T + self.Q
+        # 모델 저장 (개선)
+        if success_rate > best_success_rate and total_steps > start_steps:
+            best_success_rate = success_rate
+            best_path = os.path.join(log_dir, f"best_model_sr{success_rate:.3f}.pt")
+            agent.save(best_path)
+            print(f"Saved best model with success rate: {success_rate:.3f}")
 
-        self.state = new_state
-        self.covariance = new_covariance
+        # 주기적 저장
+        if episode and episode % 500 == 0:
+            path = os.path.join(log_dir, f"gru_sac_ep{episode}.pt")
+            agent.save(path)
 
-        return self.state
+    # 최종 저장
+    final_path = os.path.join(log_dir, "gru_sac_final.pt")
+    agent.save(final_path)
 
-    def update(self, measurements):
-        """measurements = [range, heading, speed]"""
-        x, y, theta, v, w = self.state
+    # 학습 그래프 생성
+    plt.figure(figsize=(12, 8))
 
-        # 예측된 측정값 계산 (식 2)
-        predicted_range = np.sqrt((x - self.anchor_position[0]) ** 2 +
-                                  (y - self.anchor_position[1]) ** 2)
-        predicted_heading = theta
-        predicted_velocity = v
+    plt.subplot(2, 2, 1)
+    plt.plot(episode_rewards)
+    plt.title('Episode Rewards')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
 
-        # 혁신(Innovation)
-        innovation = np.array([
-            measurements[0] - predicted_range,
-            measurements[1] - predicted_heading,
-            measurements[2] - predicted_velocity
-        ])
+    plt.subplot(2, 2, 2)
+    window_size = 100
+    if len(episode_rewards) > window_size:
+        smoothed_rewards = np.convolve(episode_rewards,
+                                       np.ones(window_size) / window_size,
+                                       mode='valid')
+        plt.plot(smoothed_rewards)
+        plt.title(f'Smoothed Rewards (window={window_size})')
+        plt.xlabel('Episode')
+        plt.ylabel('Average Reward')
 
-        # 관측 행렬의 자코비안
-        H = np.zeros((3, 5))
-        if predicted_range > 1e-6:
-            H[0, 0] = (x - self.anchor_position[0]) / predicted_range
-            H[0, 1] = (y - self.anchor_position[1]) / predicted_range
-        H[1, 2] = 1
-        H[2, 3] = 1
+    plt.subplot(2, 2, 3)
+    success_rates = []
+    collision_rates = []
+    for i in range(len(success_window)):
+        if i >= 99:
+            success_rates.append(sum(success_window[i - 99:i + 1]) / 100)
+            collision_rates.append(sum(collision_window[i - 99:i + 1]) / 100)
 
-        # 칼만 이득 계산
-        S = H @ self.covariance @ H.T + self.R
-        K = self.covariance @ H.T @ np.linalg.inv(S)
-
-        # 상태 업데이트
-        self.state = self.state + K @ innovation
-
-        # 공분산 업데이트
-        I = np.eye(5)
-        self.covariance = (I - K @ H) @ self.covariance
-
-        return self.state
-
-
-def quaternion_to_euler(x, y, z, w):
-    """쿼터니언을 오일러 각도(yaw)로 변환"""
-    rotation = R.from_quat([x, y, z, w])
-    euler = rotation.as_euler('xyz')
-    return euler[2]  # yaw
-
-
-def extract_range_data(ranges_str):
-    """ranges 문자열에서 거리 데이터 추출"""
-    try:
-        # 첫 번째 range 값 추출
-        ranges = ranges_str.split(',')
-        for r in ranges:
-            if 'range:' in r:
-                value = float(r.split(':')[1].strip())
-                return value
-    except:
-        return None
-    return None
-
-
-def synchronize_data(flare_data, imu_data, max_time_diff=0.1):
-    """UWB와 IMU 데이터 동기화"""
-    synced_data = []
-
-    for i, flare_row in flare_data.iterrows():
-        flare_time = flare_row['Time']
-
-        # 가장 가까운 IMU 데이터 찾기
-        time_diffs = np.abs(imu_data['Time'] - flare_time)
-        min_idx = time_diffs.argmin()
-        min_diff = time_diffs.iloc[min_idx]
-
-        if min_diff < max_time_diff:
-            imu_row = imu_data.iloc[min_idx]
-
-            # UWB range 추출
-            range_value = extract_range_data(flare_row['ranges'])
-
-            if range_value is not None:
-                synced_data.append({
-                    'time': flare_time,
-                    'range': range_value,
-                    'true_x': flare_row['pos.x'],
-                    'true_y': flare_row['pos.y'],
-                    'quat_x': imu_row['orientation.x'],
-                    'quat_y': imu_row['orientation.y'],
-                    'quat_z': imu_row['orientation.z'],
-                    'quat_w': imu_row['orientation.w']
-                })
-
-    return pd.DataFrame(synced_data)
-
-
-def main():
-    # 데이터 로드
-    flare_data = pd.read_csv('rtls_flares.csv')
-    imu_data = pd.read_csv('waveshare_sense_hat_b.csv')
-
-    # 데이터 동기화
-    synced_data = synchronize_data(flare_data, imu_data)
-
-    # 알고리즘 초기화
-    speed_estimator = SpeedEstimator(delta_t=0.1)
-
-    # EKF 초기화
-    initial_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0])  # [x, y, theta, v, w]
-    initial_covariance = np.eye(5) * 0.1
-    ekf = ExtendedKalmanFilter(initial_state, initial_covariance)
-
-    # 결과 저장을 위한 리스트
-    estimated_trajectory = []
-    true_trajectory = []
-    estimated_speeds = []
-    range_measurements = []
-
-    # 알고리즘 실행
-    for i, row in synced_data.iterrows():
-        # UWB range 데이터 처리
-        time = row['time']
-        range_measurement = row['range']
-
-        # 속도 추정
-        speed = speed_estimator.update(range_measurement, time)
-
-        # IMU 방향 데이터 처리
-        yaw = quaternion_to_euler(row['quat_x'], row['quat_y'],
-                                  row['quat_z'], row['quat_w'])
-
-        # EKF 예측 단계
-        ekf.predict()
-
-        # EKF 업데이트 단계
-        measurements = [range_measurement, yaw, speed]
-        state = ekf.update(measurements)
-
-        # 결과 저장
-        estimated_trajectory.append([state[0], state[1]])
-        true_trajectory.append([row['true_x'], row['true_y']])
-        estimated_speeds.append(speed)
-        range_measurements.append(range_measurement)
-
-    # 결과 시각화
-    estimated_trajectory = np.array(estimated_trajectory)
-    true_trajectory = np.array(true_trajectory)
-
-    # 경로 플롯
-    plt.figure(figsize=(15, 5))
-
-    plt.subplot(131)
-    plt.plot(estimated_trajectory[:, 0], estimated_trajectory[:, 1], 'b-', label='Estimated')
-    plt.plot(true_trajectory[:, 0], true_trajectory[:, 1], 'r--', label='True')
-    plt.xlabel('X position (m)')
-    plt.ylabel('Y position (m)')
+    plt.plot(success_rates, label='Success Rate')
+    plt.plot(collision_rates, label='Collision Rate')
+    plt.title('Success/Collision Rates (100-ep window)')
+    plt.xlabel('Episode')
+    plt.ylabel('Rate')
     plt.legend()
-    plt.title('Robot Trajectory')
-    plt.axis('equal')
 
-    # 속도 플롯
-    plt.subplot(132)
-    plt.plot(estimated_speeds, 'g-', label='Estimated Speed')
-    plt.xlabel('Sample')
-    plt.ylabel('Speed (m/s)')
-    plt.legend()
-    plt.title('Speed Estimation')
-
-    # Range 플롯
-    plt.subplot(133)
-    plt.plot(range_measurements, 'c-', label='UWB Range')
-    plt.xlabel('Sample')
-    plt.ylabel('Range (m)')
-    plt.legend()
-    plt.title('UWB Range Measurements')
+    plt.subplot(2, 2, 4)
+    plt.hist(episode_rewards, bins=50)
+    plt.title('Reward Distribution')
+    plt.xlabel('Reward')
+    plt.ylabel('Frequency')
 
     plt.tight_layout()
-    plt.show()
+    plt.savefig(os.path.join(log_dir, 'training_summary.png'), dpi=300)
+    plt.close()
 
-    # 에러 계산
-    position_error = np.linalg.norm(estimated_trajectory - true_trajectory, axis=1)
-    rmse = np.sqrt(np.mean(position_error ** 2))
-    print(f"Position RMSE: {rmse:.3f} m")
+    return episode_rewards
+
+
+def test_agent(env, agent, num_episodes, max_steps=SACConfig.max_episode_steps,
+               render=False, log_dir="logs", noise_level=0.0):
+    os.makedirs(log_dir, exist_ok=True)
+    episode_rewards, step_counts = [], []
+    success_count = collision_count = timeout_count = 0
+
+    # 상세 통계
+    detailed_stats = []
+
+    for episode in range(num_episodes):
+        ep_reward, steps = 0.0, 0
+        depth, state = env.reset()
+        agent.reset_hidden()
+
+        # 에피소드별 상세 추적
+        episode_info = {
+            'actions': [],
+            'states': [],
+            'rewards': []
+        }
+
+        for step_count in range(max_steps):
+            action = agent.select_action(depth, state, evaluate=True)
+
+            # 추가 노이즈 (테스트 목적)
+            if noise_level > 0:
+                action += np.random.normal(0, noise_level, size=action.shape)
+                action = np.clip(action, -agent.max_action, agent.max_action)
+
+            depth, state, reward, done, info = env.step(action)
+
+            # 상세 정보 저장
+            episode_info['actions'].append(action.copy())
+            episode_info['states'].append(state.copy())
+            episode_info['rewards'].append(reward)
+
+            ep_reward += reward
+            steps += 1
+
+            if render:
+                env.visualize_3d_lidar(depth, frame_count=step_count, show=True)
+
+            if done:
+                break
+
+        status = info.get('status', 'unknown')
+        if status == 'goal_reached':
+            success_count += 1
+        elif status == 'collision':
+            collision_count += 1
+        elif info.get('timeout', False):
+            timeout_count += 1
+
+        episode_rewards.append(ep_reward)
+        step_counts.append(steps)
+        detailed_stats.append(episode_info)
+
+        print(f"Test {episode}: Reward={ep_reward:.2f}, Steps={steps}, Status={status}")
+
+    # 결과 통계
+    success_rate = success_count / num_episodes
+    collision_rate = collision_count / num_episodes
+    timeout_rate = timeout_count / num_episodes
+
+    print("\n=== Test Results ===")
+    print(f"Success Rate: {success_rate:.3f}")
+    print(f"Collision Rate: {collision_rate:.3f}")
+    print(f"Timeout Rate: {timeout_rate:.3f}")
+    print(f"Average Reward: {np.mean(episode_rewards):.2f}")
+    print(f"Average Steps: {np.mean(step_counts):.2f}")
+
+    # 결과 저장
+    results_path = os.path.join(log_dir, "test_results.npz")
+    np.savez(results_path,
+             rewards=episode_rewards,
+             steps=step_counts,
+             success_rate=success_rate,
+             collision_rate=collision_rate,
+             timeout_rate=timeout_rate)
+
+    return success_rate, episode_rewards, step_counts
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["train", "test"], default="train")
+    parser.add_argument("--episodes", type=int, default=5000)
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--log_dir", type=str, default="logs")
+    parser.add_argument("--model_path", type=str)
+    parser.add_argument("--max_steps", type=int, default=SACConfig.max_episode_steps)
+    parser.add_argument("--noise", type=float, default=0.0)
+    parser.add_argument("--continue", dest="continue_train", action="store_true")
+    parser.add_argument("--gpu", action="store_true")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    env = DroneEnv()
+    depth, state = env.reset()
+    state_dim = len(state)
+    action_dim = 3
+    agent = GRUSACAgent(state_dim, action_dim,
+                        o_dim=(Config.depth_image_height, Config.depth_image_width),
+                        max_action=Config.max_drone_speed, device=device)
+
+    if args.mode == "train":
+        if args.continue_train and args.model_path:
+            agent.load(args.model_path)
+            print(f"Continuing training from {args.model_path}")
+
+        rewards = train_agent(env, agent, args.episodes,
+                              max_steps=args.max_steps, render=args.render,
+                              log_dir=args.log_dir)
+    else:
+        if not args.model_path:
+            raise ValueError("Model path required for test mode")
+        agent.load(args.model_path)
+        test_agent(env, agent, args.episodes,
+                   max_steps=args.max_steps, render=args.render,
+                   log_dir=args.log_dir, noise_level=args.noise)

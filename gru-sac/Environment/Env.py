@@ -7,8 +7,8 @@ import torch
 import matplotlib.pyplot as plt
 
 class Config:
-    depth_image_height = 84
-    depth_image_width = 84
+    depth_image_height = 42
+    depth_image_width = 42
     max_lidar_distance = 20
     max_drone_speed = 5
     goal_threshold = 3
