@@ -78,78 +78,51 @@ class DroneEnv:
         self.steps = 0
 
     def reset(self):
-        # 드론 초기화
         self.client.reset()
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
-        self.client.takeoffAsync().join()
+        self.client.takeoffAsync().join()  # 반드시 대기  :contentReference[oaicite:14]{index=14}
 
-        # 초기 위치로 이동 (홈 위치, 약간의 랜덤성 추가)
-        initial_x, initial_y, initial_z = [0, 0, 0]
+        self.client.moveToPositionAsync(0, 0, 0, 5).join()
 
-        self.client.moveToPositionAsync(initial_x, initial_y, initial_z, 5).join()
-
-        # 새로운 목표 위치 (랜덤)
-        while True:
-            self.goal_position = np.array([
-                random.uniform(-19.0, 19.0),
-                random.uniform(-19.0, 19.0),
-                random.uniform(-19.0, 19.0)
-            ])
-
-            self.goal_distance = np.linalg.norm(self.goal_position)
-            self.prev_goal_distance = self.goal_distance
-            if self.goal_distance >= 15:
-                print(f"New goal position: {self.goal_position}")
-                break
-
-        # 스텝 카운터 초기화
+        # 목표 설정 ...
         self.steps = 0
+        depth, state, _ = self._get_state()
 
-        # 초기 상태 가져오기
-        depth_image, drone_state, position = self._get_state()
+        # 관측 일관성: step과 동일하게 방향 정규화 (또는 아예 정규화 제거로 통일)
+        g = np.linalg.norm(state[3:6]) + 1e-6
+        state[3:6] = state[3:6] / g
+        self.prev_goal_distance = g  # 초기 prev도 맞춰 둠
 
-        return depth_image, drone_state
+        return depth, state
 
-    def step(self, action):
+    def step(self, action, dt=0.2):
+        # --- 이전 관측으로 블렌딩 벡터 계산 ---
+        depth_prev, state_prev, _ = self._get_state()
+        goal_dir = state_prev[3:6]
+        goal_dir = goal_dir / (np.linalg.norm(goal_dir) + 1e-6)
+        blend = goal_dir * Config.max_drone_speed
+        action = 0.2 * blend + 0.8 * action  # :contentReference[oaicite:15]{index=15}
 
-        # 상태 및 라이다 데이터 가져오기
-        depth_image, state, position = self._get_state()
+        vx, vy, vz = map(float, action)
+        self.client.moveByVelocityAsync(vx, vy, vz, dt).join()  # 반드시 대기  :contentReference[oaicite:16]{index=16}
 
-        dir = state[3:] / np.linalg.norm(state[3:])
+        # --- 이동 후 새 관측으로 보상/종료 판정 ---
+        depth, state, pos = self._get_state()
+        reward, done, info = self._compute_reward(depth, state,
+                                                  pos)  # 내부에서 prev 업데이트  :contentReference[oaicite:17]{index=17}
 
-        blend_action = dir * Config.max_drone_speed
+        # 관측 일관성 유지: 방향 성분 정규화
+        g = np.linalg.norm(state[3:6]) + 1e-6
+        state[3:6] = state[3:6] / g
 
-        action = 0.2 * blend_action + action * 0.8
-
-        # 액션 적용 (vx, vy, vz 속도)
-        vx, vy, vz = action
-
-        # AirSim에서는 NED 좌표계 사용
-        self.client.moveByVelocityAsync(
-            float(vx),
-            float(vy),
-            float(vz),  # AirSim에서 z는 아래 방향이 양수
-            1.0  # 1초 동안 속도 유지
-        )
-
-        # 보상과 종료 여부 계산
-        reward, done, info = self._compute_reward(depth_image, state, position)
-
-        state[3:] /= np.linalg.norm(state[3:])
-
-        # 스텝 카운터 증가
         self.steps += 1
-
-        # self.visualize_3d_lidar(depth_image, show=True)
-
-        # 최대 스텝 수 초과 시 종료
         if self.steps >= Config.max_episode_steps:
-            print(f"timeout: {position}")
             done = True
-            info['timeout'] = True
+            info = dict(info or {})
+            info["timeout"] = True
 
-        return depth_image, state, reward, done, info
+        return depth, state, reward, done, info
 
     def _compute_reward(self, depth_image, drone_state, position):
         # 현재 위치와 목표 위치 거리

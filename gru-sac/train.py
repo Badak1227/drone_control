@@ -788,15 +788,26 @@ class ModelManager:
             self.agent.alpha = self.agent.log_alpha.exp().item()
             self.update_counter += 1
 
+    # ➜ 아래 메서드 추가
+    def get_state_dim(self):
+        with self.lock:
+            return int(self.agent.state_dim)
+
 
 # 매니저 등록
-BaseManager.register('ModelManager', ModelManager)
+
+BaseManager.register(
+    'ModelManager',
+    ModelManager,
+    exposed=('get_weights', 'update_weights', 'get_state_dim')
+)
+
 
 
 def data_collector(model_manager, queue, stop_event):
     """수집 에이전트 - 최신 모델로 환경과 상호작용하며 데이터 수집"""
     # 로컬 에이전트 초기화
-    local_agent = RecurrentSAC(state_dim=model_manager.agent.state_dim)
+    local_agent = RecurrentSAC(state_dim=model_manager.get_state_dim())
     last_update = -1
 
     env = DroneEnv()  # 환경 생성
@@ -827,7 +838,7 @@ def data_collector(model_manager, queue, stop_event):
 
 def learner(model_manager, queue, stop_event):
     """학습 에이전트 - 데이터로 모델 학습 및 중앙 모델 가중치 업데이트"""
-    agent = model_manager.agent
+    agent = RecurrentSAC(state_dim=model_manager.get_state_dim())
     update_freq = 100  # 가중치 업데이트 빈도
     steps = 0
 
